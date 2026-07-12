@@ -1,0 +1,166 @@
+## Goal: Publisher + Subscriber 
+import os
+import time
+
+# Import Solace Python  API modules
+from solace.messaging.messaging_service import MessagingService, ReconnectionListener, ReconnectionAttemptListener, ServiceInterruptionListener, RetryStrategy, ServiceEvent
+from solace.messaging.errors.pubsubplus_client_error import PubSubPlusClientError
+from solace.messaging.publisher.direct_message_publisher import PublishFailureListener, FailedPublishEvent
+from solace.messaging.resources.topic_subscription import TopicSubscription
+from solace.messaging.receiver.message_receiver import MessageHandler
+from solace.messaging.config.solace_properties.message_properties import APPLICATION_MESSAGE_ID
+from solace.messaging.resources.topic import Topic
+from solace.messaging.receiver.inbound_message import InboundMessage
+
+from datasets import load_dataset #this was done to import the dataset into the document so it can be directly accessed 
+import json #to parse the data into readable objects 
+
+TICKER = "AAPL"
+
+ds = load_dataset("paperswithbacktest/Stocks-Daily-Price", split="train")
+stock_df = ds.to_pandas()
+stock_df = stock_df[stock_df["symbol"] == TICKER].sort_values("date").reset_index(drop=True)
+
+import threading 
+from collections import deque
+from data_store import data_store
+
+TOPIC_PREFIX = "solace/samples"
+SHUTDOWN = False
+
+# Handle received messages
+class MessageHandlerImpl(MessageHandler):
+    def on_message(self, message: 'InboundMessage'):
+        try:
+            global SHUTDOWN
+            if "quit" in message.get_destination_name():
+                print("QUIT message received, shutting down.")
+                SHUTDOWN = True 
+                return
+            # Check if the payload is a String or Byte, decode if its the later
+            payload = message.get_payload_as_string() or message.get_payload_as_bytes()
+            if isinstance(payload, bytearray):
+                payload = payload.decode()
+            
+            data = json.loads(payload)
+            data_store.add(data["date"], data["open"]) #to parse and store instead of just printing the message
+
+            print(f"Stored: {data['date']} -> {data['open']}")
+            
+        except Exception as e:
+            print(f"Error processing message: {e.__traceback__}")
+
+# Inner classes for error handling
+class ServiceEventHandler(ReconnectionListener, ReconnectionAttemptListener, ServiceInterruptionListener):
+    def on_reconnected(self, e: ServiceEvent):
+        print("\non_reconnected")
+        print(f"Error cause: {e.get_cause()}")
+        print(f"Message: {e.get_message()}")
+    
+    def on_reconnecting(self, e: "ServiceEvent"):
+        print("\non_reconnecting")
+        print(f"Error cause: {e.get_cause()}")
+        print(f"Message: {e.get_message()}")
+
+    def on_service_interrupted(self, e: "ServiceEvent"):
+        print("\non_service_interrupted")
+        print(f"Error cause: {e.get_cause()}")
+        print(f"Message: {e.get_message()}")
+
+class PublisherErrorHandling(PublishFailureListener):
+    def on_failed_publish(self, e: "FailedPublishEvent"):
+        print("on_failed_publish")
+
+def run_streamer():
+    # Broker Config
+    broker_props = {
+        "solace.messaging.transport.host": os.environ.get('SOLACE_HOST') or "",
+        "solace.messaging.service.vpn-name": os.environ.get('SOLACE_VPN') or "",
+        "solace.messaging.authentication.scheme.basic.username": os.environ.get('SOLACE_USERNAME') or "",
+        "solace.messaging.authentication.scheme.basic.password": os.environ.get('SOLACE_PASSWORD') or ""
+        }
+
+    # Build A messaging service with a reconnection strategy of 20 retries over an interval of 3 seconds
+    # Note: The reconnections strategy could also be configured using the broker properties object
+    messaging_service = MessagingService.builder().from_properties(broker_props)\
+                        .with_reconnection_retry_strategy(RetryStrategy.parametrized_retry(20,3))\
+                        .build()
+
+    # Blocking connect thread
+    messaging_service.connect()
+    # print(f'Messaging Service connected? {messaging_service.is_connected}')
+
+    # Error Handeling for the messaging service
+    service_handler = ServiceEventHandler()
+    messaging_service.add_reconnection_listener(service_handler)
+    messaging_service.add_reconnection_attempt_listener(service_handler)
+    messaging_service.add_service_interruption_listener(service_handler)
+
+    # Create a direct message publisher and start it
+    direct_publisher = messaging_service.create_direct_message_publisher_builder().build()
+    direct_publisher.set_publish_failure_listener(PublisherErrorHandling())
+    direct_publisher.set_publisher_readiness_listener
+
+    # Blocking Start thread
+    direct_publisher.start()
+    # print(f'Direct Publisher ready? {direct_publisher.is_ready()}')
+
+    unique_name = ""
+    while not unique_name:
+        unique_name = input("Enter your name: ").replace(" ", "")
+
+    # Define a Topic subscriptions 
+    topics = [TOPIC_PREFIX + "/python/stocks/>"]
+    topics_sub = []
+    for t in topics:
+        topics_sub.append(TopicSubscription.of(t))
+
+    msgSeqNum = 0
+    # Prepare outbound message payload and body
+    message_body = f'Hello from Python Hello World Sample!'
+    message_builder = messaging_service.message_builder() \
+                    .with_application_message_id("sample_id") \
+                    .with_property("application", "samples") \
+                    .with_property("language", "Python") \
+
+    try:
+        print(f"Subscribed to: {topics}")
+        # Build a Receiver
+        direct_receiver = messaging_service.create_direct_message_receiver_builder().with_subscriptions(topics_sub).build()
+        direct_receiver.start()
+        # Callback for received messages
+        direct_receiver.receive_async(MessageHandlerImpl())
+        if direct_receiver.is_running():
+            print("Connected and Subscribed! Ready to publish\n")
+        try:
+            row_index = 0
+            while not SHUTDOWN and row_index < len(stock_df):
+                row = stock_df.iloc[row_index]
+                msgSeqNum = row_index + 1
+                # Check https://docs.solace.com/API-Developer-Online-Ref-Documentation/python/source/rst/solace.messaging.config.solace_properties.html for additional message properties
+                # Note: additional properties override what is set by the message_builder
+                additional_properties = {APPLICATION_MESSAGE_ID: f'sample_id {msgSeqNum}'}
+                # Creating a dynamic outbound message from the current row
+                payload = json.dumps({
+                    "date": str(row["date"]),
+                    "ticker": TICKER,
+                    "open": float(row["open"])
+                })
+                outbound_message = message_builder.build(payload, additional_message_properties=additional_properties)
+                # Direct publish the message
+                direct_publisher.publish(destination=Topic.of(TOPIC_PREFIX + f"/python/stocks/{TICKER}/{msgSeqNum}"), message=outbound_message)
+                row_index += 1
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print('\nDisconnecting Messaging Service')
+        except PubSubPlusClientError as exception:
+            print(f'Received a PubSubPlusClientException: {exception}')
+    finally:
+        print('Terminating Publisher and Receiver')
+        direct_publisher.terminate()
+        direct_receiver.terminate()
+        print('Disconnecting Messaging Service')
+        messaging_service.disconnect()
+
+if __name__ == "__main__":
+    run_streamer()
