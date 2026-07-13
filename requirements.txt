@@ -1,0 +1,5 @@
+dash
+plotly
+solace-pubsubplus
+datasets
+pandas
