@@ -19,7 +19,8 @@ TICKER = "AAPL"
 
 ds = load_dataset("paperswithbacktest/Stocks-Daily-Price", split="train")
 stock_df = ds.to_pandas()
-stock_df = stock_df[stock_df["symbol"] == TICKER].sort_values("date").reset_index(drop=True)
+stock_df = stock_df[stock_df["symbol"] == TICKER].sort_values("date").reset_index(drop=True) 
+    #this line filters, sorts and reindexes the dataset. drop = TRUE means we delete the old ordering altogether 
 
 import threading 
 from collections import deque
@@ -29,10 +30,10 @@ TOPIC_PREFIX = "solace/samples"
 SHUTDOWN = False
 
 # Handle received messages
-class MessageHandlerImpl(MessageHandler):
+class MessageHandlerImpl(MessageHandler): 
     def on_message(self, message: 'InboundMessage'):
         try:
-            global SHUTDOWN
+            global SHUTDOWN #global tells the code it is the global variable 
             if "quit" in message.get_destination_name():
                 print("QUIT message received, shutting down.")
                 SHUTDOWN = True 
@@ -74,10 +75,10 @@ class PublisherErrorHandling(PublishFailureListener):
 def run_streamer():
     # Broker Config
     broker_props = {
-        "solace.messaging.transport.host": os.environ.get('SOLACE_HOST') or "",
-        "solace.messaging.service.vpn-name": os.environ.get('SOLACE_VPN') or "",
-        "solace.messaging.authentication.scheme.basic.username": os.environ.get('SOLACE_USERNAME') or "",
-        "solace.messaging.authentication.scheme.basic.password": os.environ.get('SOLACE_PASSWORD') or ""
+        "solace.messaging.transport.host": os.environ.get('SOLACE_HOST') or "tcp://localhost:55554",
+        "solace.messaging.service.vpn-name": os.environ.get('SOLACE_VPN') or "default",
+        "solace.messaging.authentication.scheme.basic.username": os.environ.get('SOLACE_USERNAME') or "admin",
+        "solace.messaging.authentication.scheme.basic.password": os.environ.get('SOLACE_PASSWORD') or "admin"
         }
 
     # Build A messaging service with a reconnection strategy of 20 retries over an interval of 3 seconds
@@ -105,10 +106,6 @@ def run_streamer():
     direct_publisher.start()
     # print(f'Direct Publisher ready? {direct_publisher.is_ready()}')
 
-    unique_name = ""
-    while not unique_name:
-        unique_name = input("Enter your name: ").replace(" ", "")
-
     # Define a Topic subscriptions 
     topics = [TOPIC_PREFIX + "/python/stocks/>"]
     topics_sub = []
@@ -116,8 +113,7 @@ def run_streamer():
         topics_sub.append(TopicSubscription.of(t))
 
     msgSeqNum = 0
-    # Prepare outbound message payload and body
-    message_body = f'Hello from Python Hello World Sample!'
+    # Prepare outbound message 
     message_builder = messaging_service.message_builder() \
                     .with_application_message_id("sample_id") \
                     .with_property("application", "samples") \
