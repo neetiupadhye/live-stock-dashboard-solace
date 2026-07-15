@@ -13,21 +13,21 @@ The project demonstrates an end-to-end event-driven architecture: a background t
 │  Yahoo Finance  │      │   Solace PubSub+  │      │  Dash Web App   │
 │  (yfinance API) │      │   Event Broker    │      │ (localhost:8050)│
 └────────┬────────┘      └─────────┬─────────┘      └───────┬─────────┘
-         │ poll every 15s           │                          │
-         ▼                          │                          │
-┌──────────────────┐   publish      │      receive             │
-│ stock_price_      ├───────────────►                          │
-│ streamer.py       │◄──────────────┤                          │
-│ (background       │  subscribe    │                          │
-│  thread)           │                                          │
-└────────┬───────────┘                                          │
-         │ write                                                │
-         ▼                                                      │
-┌──────────────────┐   read (1x/sec)                            │
-│   data_store.py   ├──────────────────────────────────────────►│
-│ (thread-safe       │                                          │
-│  shared store)     │                                          │
-└────────────────────┘                                dashboard.py
+         │ poll every 15s          │                        │
+         ▼                         │                        │
+┌──────────────────┐   publish     │                        │
+│ stock_price_     ├───────────────►                        │
+│ streamer.py      │◄──────────────┤                        │
+│ (background      │  subscribe    │                        │
+│  thread)         │                                        │
+└────────┬─────────┘                                        │
+         │ write                                            │
+         ▼                                                  │
+┌──────────────────┐   read (1x)                            │
+│   data_store.py  ├───────────────────────────────────────►│
+│ (thread-safe     │                                        │
+│  shared store    │                                        │
+└──────────────────┘                                  dashboard.py
 ```
 
 `main.py` wires everything together: it starts the streamer on a daemon background thread and runs the Dash server on the main thread. Both sides share a single `data_store` instance in memory, guarded by a lock, so producer and consumer never race.
@@ -59,13 +59,13 @@ This publish → receive → store round-trip (rather than writing directly from
 
 ## Tech Stack
 
-| Component        | Technology                          |
-|-------------------|--------------------------------------|
-| Messaging broker  | Solace PubSub+ (Python API)         |
-| Market data       | [yfinance](https://pypi.org/project/yfinance/) |
-| Dashboard / UI    | [Dash](https://dash.plotly.com/) + Plotly |
-| Language          | Python 3                            |
-| Concurrency       | `threading` (daemon background thread) |
+| Component        | Technology                                     |
+|------------------|------------------------------------------------|
+| Messaging broker | Solace PubSub+ (Python API)                    |
+| Market data      | [yfinance](https://pypi.org/project/yfinance/) |
+| Dashboard / UI   | [Dash](https://dash.plotly.com/) + Plotly      |
+| Language         | Python 3                                       |
+| Concurrency      | `threading` (daemon background thread)         |
 
 ---
 
