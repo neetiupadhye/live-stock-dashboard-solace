@@ -9,10 +9,10 @@ The project demonstrates an end-to-end event-driven architecture: a background t
 ## Architecture
 
 ```
-┌─────────────────┐      ┌───────────────────┐      ┌──────────────────┐
-│  Yahoo Finance   │      │   Solace PubSub+   │      │   Dash Web App   │
-│  (yfinance API)  │      │   Event Broker      │      │  (localhost:8050)│
-└────────┬─────────┘      └─────────┬──────────┘      └────────┬─────────┘
+┌─────────────────┐      ┌───────────────────┐      ┌─────────────────┐
+│  Yahoo Finance  │      │   Solace PubSub+  │      │  Dash Web App   │
+│  (yfinance API) │      │   Event Broker    │      │ (localhost:8050)│
+└────────┬────────┘      └─────────┬─────────┘      └───────┬─────────┘
          │ poll every 15s           │                          │
          ▼                          │                          │
 ┌──────────────────┐   publish      │      receive             │
