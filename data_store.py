@@ -24,28 +24,28 @@ class DataStore:
         reached (keeps memory bounded for a long-running stream).
         """
         self.dates = deque(maxlen=max_points)
-        self.opens = deque(maxlen=max_points)
+        self.currents = deque(maxlen=max_points)
         self.lock = threading.Lock()
 
-    def add(self, date, open_price):
+    def add(self, date, current_price):
         """Add one new data point. Safe to call from any thread."""
         with self.lock:
             self.dates.append(date)
-            self.opens.append(open_price)
+            self.currents.append(current_price)
 
     def get_data(self):
         """
         Return a snapshot copy of the current data as two plain lists:
-        (dates, opens). Safe to call from any thread.
+        (dates, currents). Safe to call from any thread.
         """
         with self.lock:
-            return list(self.dates), list(self.opens)
+            return list(self.dates), list(self.currents)
 
     def clear(self):
         """Wipe all stored data."""
         with self.lock:
             self.dates.clear()
-            self.opens.clear()
+            self.currents.clear()
 
 
 # A single shared instance — both stock_price_streamer.py and
@@ -61,6 +61,6 @@ if __name__ == "__main__":
     data_store.add("2024-01-02", 101.2)
     data_store.add("2024-01-03", 99.8)
 
-    dates, opens = data_store.get_data()
+    dates, currents = data_store.get_data()
     print("Dates:", dates)
-    print("Opens:", opens)
+    print("Currents:", currents)

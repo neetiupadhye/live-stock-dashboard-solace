@@ -1,4 +1,4 @@
-## Goal: Publisher + Subscriber 
+## Goal: Publisher + Subscriber (live yfinance version)
 import os
 import time
 
@@ -12,42 +12,64 @@ from solace.messaging.config.solace_properties.message_properties import APPLICA
 from solace.messaging.resources.topic import Topic
 from solace.messaging.receiver.inbound_message import InboundMessage
 
-from datasets import load_dataset #this was done to import the dataset into the document so it can be directly accessed 
-import json #to parse the data into readable objects 
+import yfinance as yf
+import json #to parse the data into readable objects
 
-TICKER = "AAPL"
-
-ds = load_dataset("paperswithbacktest/Stocks-Daily-Price", split="train")
-stock_df = ds.to_pandas()
-stock_df = stock_df[stock_df["symbol"] == TICKER].sort_values("date").reset_index(drop=True) 
-    #this line filters, sorts and reindexes the dataset. drop = TRUE means we delete the old ordering altogether 
-
-import threading 
+import threading
 from collections import deque
 from data_store import data_store
 
+TICKER = "D05.SI"   # DBS Group Holdings, listed on SGX — swapped from AAPL so the market is actually open right now (SGX trades 9am-5pm SGT); change back to "AAPL" once you're testing during US market hours
 TOPIC_PREFIX = "solace/samples"
+POLL_INTERVAL_SECONDS = 15   # 1-minute bars can't update faster than once a minute anyway; 15s just catches the new bar promptly without hammering the endpoint
 SHUTDOWN = False
 
+
+def get_latest_quote(ticker_symbol):
+    """
+    Fetch the most recent price tick for a ticker via yfinance.
+
+    NOTE: we intentionally use history(period="1d", interval="1m") here
+    instead of Ticker.fast_info. fast_info hits a lightweight Yahoo quote
+    endpoint that gets cached upstream and can return the exact same
+    price for many polls in a row if you poll faster than that cache
+    refreshes. Pulling the latest 1-minute bar avoids that.
+    """
+    ticker_obj = yf.Ticker(ticker_symbol)
+    bars = ticker_obj.history(period="1d", interval="1m")
+    if bars.empty:
+        raise RuntimeError(f"No intraday data returned for {ticker_symbol} (market may be closed)")
+
+    last_bar = bars.iloc[-1]
+    bar_timestamp = bars.index[-1]   # the actual market timestamp this price applies to
+
+    return {
+        "date": bar_timestamp.isoformat(),   # real market time the bar represents, not the time we happened to poll
+        "ticker": ticker_symbol,
+        "current": float(last_bar["Close"]),
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),   # debug only: wall-clock time we polled, kept to show how much lag exists
+    }
+
+
 # Handle received messages
-class MessageHandlerImpl(MessageHandler): 
+class MessageHandlerImpl(MessageHandler):
     def on_message(self, message: 'InboundMessage'):
         try:
-            global SHUTDOWN #global tells the code it is the global variable 
+            global SHUTDOWN #global tells the code it is the global variable
             if "quit" in message.get_destination_name():
                 print("QUIT message received, shutting down.")
-                SHUTDOWN = True 
+                SHUTDOWN = True
                 return
             # Check if the payload is a String or Byte, decode if its the later
             payload = message.get_payload_as_string() or message.get_payload_as_bytes()
             if isinstance(payload, bytearray):
                 payload = payload.decode()
-            
-            data = json.loads(payload)
-            data_store.add(data["date"], data["open"]) #to parse and store instead of just printing the message
 
-            print(f"Stored: {data['date']} -> {data['open']}")
-            
+            data = json.loads(payload)
+            data_store.add(data["date"], data["current"]) #to parse and store instead of just printing the message
+
+            print(f"Stored: {data['date']} -> {data['current']}")
+
         except Exception as e:
             print(f"Error processing message: {e.__traceback__}")
 
@@ -57,7 +79,7 @@ class ServiceEventHandler(ReconnectionListener, ReconnectionAttemptListener, Ser
         print("\non_reconnected")
         print(f"Error cause: {e.get_cause()}")
         print(f"Message: {e.get_message()}")
-    
+
     def on_reconnecting(self, e: "ServiceEvent"):
         print("\non_reconnecting")
         print(f"Error cause: {e.get_cause()}")
@@ -106,14 +128,13 @@ def run_streamer():
     direct_publisher.start()
     # print(f'Direct Publisher ready? {direct_publisher.is_ready()}')
 
-    # Define a Topic subscriptions 
+    # Define a Topic subscriptions
     topics = [TOPIC_PREFIX + "/python/stocks/>"]
     topics_sub = []
     for t in topics:
         topics_sub.append(TopicSubscription.of(t))
 
-    msgSeqNum = 0
-    # Prepare outbound message 
+    # Prepare outbound message
     message_builder = messaging_service.message_builder() \
                     .with_application_message_id("sample_id") \
                     .with_property("application", "samples") \
@@ -129,24 +150,34 @@ def run_streamer():
         if direct_receiver.is_running():
             print("Connected and Subscribed! Ready to publish\n")
         try:
-            row_index = 0
-            while not SHUTDOWN and row_index < len(stock_df):
-                row = stock_df.iloc[row_index]
-                msgSeqNum = row_index + 1
-                # Check https://docs.solace.com/API-Developer-Online-Ref-Documentation/python/source/rst/solace.messaging.config.solace_properties.html for additional message properties
-                # Note: additional properties override what is set by the message_builder
-                additional_properties = {APPLICATION_MESSAGE_ID: f'sample_id {msgSeqNum}'}
-                # Creating a dynamic outbound message from the current row
-                payload = json.dumps({
-                    "date": str(row["date"]),
-                    "ticker": TICKER,
-                    "open": float(row["open"])
-                })
-                outbound_message = message_builder.build(payload, additional_message_properties=additional_properties)
-                # Direct publish the message
-                direct_publisher.publish(destination=Topic.of(TOPIC_PREFIX + f"/python/stocks/{TICKER}/{msgSeqNum}"), message=outbound_message)
-                row_index += 1
-                time.sleep(1)
+            msgSeqNum = 0
+            last_price = None
+            while not SHUTDOWN:
+                try:
+                    quote = get_latest_quote(TICKER)
+                except Exception as e:
+                    print(f"Error fetching quote: {e}")
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                # DEBUG: log every fetched price, even ones filtered out by dedupe below,
+                # so we can tell whether yfinance is actually returning fresh values.
+                print(f"Fetched: market_time={quote['date']} -> {quote['current']} (polled at {quote['fetched_at']})")
+
+                # Only publish when the price actually changes, to avoid flooding duplicate ticks
+                if quote["current"] != last_price:
+                    msgSeqNum += 1
+                    # Check https://docs.solace.com/API-Developer-Online-Ref-Documentation/python/source/rst/solace.messaging.config.solace_properties.html for additional message properties
+                    # Note: additional properties override what is set by the message_builder
+                    additional_properties = {APPLICATION_MESSAGE_ID: f'sample_id {msgSeqNum}'}
+                    payload = json.dumps(quote)
+                    outbound_message = message_builder.build(payload, additional_message_properties=additional_properties)
+                    # Direct publish the message
+                    direct_publisher.publish(destination=Topic.of(TOPIC_PREFIX + f"/python/stocks/{TICKER}/{msgSeqNum}"), message=outbound_message)
+                    print(f"Published: {quote['date']} -> {quote['current']}")
+                    last_price = quote["current"]
+
+                time.sleep(POLL_INTERVAL_SECONDS)
         except KeyboardInterrupt:
             print('\nDisconnecting Messaging Service')
         except PubSubPlusClientError as exception:

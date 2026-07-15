@@ -1,7 +1,7 @@
 """
 dashboard.py
 
-A live-updating Dash dashboard that plots the stock's opening price
+A live-updating Dash dashboard that plots the stock's current price
 over time, reading from the shared data_store as new data arrives.
 
 This file only READS from data_store — it never writes to it.
@@ -22,7 +22,7 @@ def build_app():
     app = Dash(__name__)
 
     app.layout = html.Div([
-        html.H2("Live Stock Opening Price"),
+        html.H2("Live Stock Current Price"),
 
         dcc.Graph(id="price-chart"),
 
@@ -37,20 +37,20 @@ def build_app():
         Input("interval-component", "n_intervals")
     )
     def update_chart(n_intervals):
-        dates, opens = data_store.get_data()
+        dates, currents = data_store.get_data()
 
         figure = go.Figure(
             data=[
                 go.Scatter(
                     x=dates,
-                    y=opens,
+                    y=currents,
                     mode="lines",
-                    name="Open Price"
+                    name="Current Price"
                 )
             ],
             layout=go.Layout(
-                xaxis_title="Date",
-                yaxis_title="Open Price",
+                xaxis_title="Market Time",   # this is the actual timestamp of each price bar, not when we polled for it — the two can differ by a few minutes
+                yaxis_title="Current Price",
                 margin=dict(l=40, r=20, t=20, b=40)
             )
         )
