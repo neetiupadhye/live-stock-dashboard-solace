@@ -99,12 +99,12 @@ pip install -r requirements.txt
 
 The Solace connection is configured via environment variables, with sensible local defaults baked in:
 
-| Variable            | Default                    | Description                          |
-|----------------------|------------------------------|----------------------------------------|
-| `SOLACE_HOST`        | `tcp://localhost:55554`     | Broker connection URI                 |
-| `SOLACE_VPN`         | `default`                   | Message VPN name                      |
-| `SOLACE_USERNAME`    | `admin`                     | Broker username                       |
-| `SOLACE_PASSWORD`    | `admin`                     | Broker password                       |
+| Variable             | Description                          |
+|----------------------|--------------------------------------|
+| `SOLACE_HOST`        | Broker connection URI                |
+| `SOLACE_VPN`         | Message VPN name                     |
+| `SOLACE_USERNAME`    | Broker username                      |
+| `SOLACE_PASSWORD`    | Broker password                      |
 
 Example (pointing at a Solace Cloud instance):
 
