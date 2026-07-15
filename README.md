@@ -82,8 +82,8 @@ This publish → receive → store round-trip (rather than writing directly from
 
 ```bash
 # Clone the repo
-git clone https://github.com/<your-username>/live-stock-streamer.git
-cd live-stock-streamer
+git clone https://github.com/<neetiupadhye>/live-stock-dashboard-solace.git
+cd live-stock-dashboard-solace
 
 # (Recommended) create a virtual environment
 python3 -m venv venv
