@@ -1,4 +1,5 @@
-# Live Stock Price Streamer & Dashboard
+# Live Stock Price Streamer & Dashboard 
+(needs to be updated) 
 
 A real-time stock price pipeline built on **Solace PubSub+** event streaming, with live market data pulled from **Yahoo Finance** and visualized in an auto-refreshing **Dash** web dashboard.
 
