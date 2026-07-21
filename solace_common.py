@@ -35,6 +35,40 @@ from solace.messaging.messaging_service import (
 # other's messages.
 TOPIC_PREFIX = "solace/samples"
 
+# The set of stocks the publisher polls/publishes and the dashboard
+# lets the user pick between. Add/remove tickers here and both sides
+# pick it up automatically.
+AVAILABLE_TICKERS = ["D05.SI", "O39.SI", "AAPL", "MSFT"]
+
+# Human-friendly display info per ticker, keyed the same way. Falls
+# back to sensible defaults in dashboard.py if a ticker isn't listed.
+TICKER_INFO = {
+    "D05.SI": {"name": "DBS GROUP HOLDINGS", "exchange": "SGX", "currency": "SGD"},
+    "O39.SI": {"name": "OCBC BANK", "exchange": "SGX", "currency": "SGD"},
+    "AAPL": {"name": "APPLE INC", "exchange": "NASDAQ", "currency": "USD"},
+    "MSFT": {"name": "MICROSOFT CORP", "exchange": "NASDAQ", "currency": "USD"},
+}
+
+
+def topic_for_ticker(ticker_symbol):
+    """
+    The topic a given ticker's ticks are published/subscribed on.
+    One topic per ticker (no sequence number in the path) so the
+    subscriber can subscribe to exactly one stock at a time.
+    """
+    return f"{TOPIC_PREFIX}/python/stocks/{ticker_symbol}"
+
+
+# Separate topic namespace used to ask the publisher to replay a
+# ticker's day-so-far history on demand — used when the dashboard
+# switches to a stock it wasn't already subscribed to, so it gets the
+# same "backfill then live" experience as the very first stock shown.
+BACKFILL_REQUEST_TOPIC_PREFIX = f"{TOPIC_PREFIX}/python/backfill-request"
+
+
+def backfill_request_topic(ticker_symbol):
+    return f"{BACKFILL_REQUEST_TOPIC_PREFIX}/{ticker_symbol}"
+
 
 def get_broker_props():
     return {

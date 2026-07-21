@@ -22,17 +22,44 @@ from dash import Dash, dcc, html, Output, Input
 import plotly.graph_objs as go
 
 from data_store import data_store
+from solace_common import AVAILABLE_TICKERS, TICKER_INFO
+from subscriber import switch_ticker
 
 # --- Config -----------------------------------------------------------
 
 # How often the chart redraws itself, in milliseconds.
 REFRESH_INTERVAL_MS = 1000
 
-COMPANY_NAME = "DBS GROUP HOLDINGS"
-TICKER_SYMBOL = "D05.SI"
-EXCHANGE_NAME = "SGX"
+# The ticker shown when the dashboard first loads — matches the topic
+# the subscriber starts subscribed to (see main.py).
+DEFAULT_TICKER = AVAILABLE_TICKERS[0]
 
 MOVING_AVERAGE_WINDOW = 10  # in data points, not minutes
+
+
+def _ticker_display_info(ticker_symbol):
+    """Look up display name/exchange/currency for a ticker, with a
+    reasonable fallback for tickers not listed in TICKER_INFO."""
+    return TICKER_INFO.get(
+        ticker_symbol,
+        {"name": ticker_symbol, "exchange": "—", "currency": "USD"},
+    )
+
+
+def _status_label_and_color(has_data, is_live):
+    """
+    Text/color for the LIVE badge, based on whether we've received any
+    data yet for the selected ticker and whether the most recent point
+    came from an open market. Distinguishes three states: still
+    connecting, live, and market closed (last known price) — so a
+    closed market like AAPL/MSFT outside US trading hours doesn't get
+    mislabeled "LIVE" just because a price is being displayed.
+    """
+    if not has_data:
+        return "CONNECTING…", COLOR_TEXT_MUTED
+    if is_live:
+        return "LIVE", COLOR_POSITIVE
+    return "MARKET CLOSED", COLOR_TEXT_MUTED
 
 # --- Palette (matches the reference design) ----------------------------
 
@@ -126,6 +153,24 @@ def build_app():
                     html.Div(
                         style={"display": "flex", "alignItems": "center", "gap": "28px"},
                         children=[
+                            dcc.Dropdown(
+                                id="ticker-dropdown",
+                                options=[
+                                    {
+                                        "label": f"{t} — {_ticker_display_info(t)['name']}",
+                                        "value": t,
+                                    }
+                                    for t in AVAILABLE_TICKERS
+                                ],
+                                value=DEFAULT_TICKER,
+                                clearable=False,
+                                searchable=False,
+                                style={
+                                    "width": "260px",
+                                    "color": "#0a0e14",
+                                    "fontSize": "13px",
+                                },
+                            ),
                             html.Div(
                                 "Dashboard",
                                 style={
@@ -172,16 +217,13 @@ def build_app():
                         children=[
                             html.Div(
                                 [
-                                    html.Span(COMPANY_NAME + " ", style={"fontWeight": 800, "fontSize": "26px"}),
-                                    html.Span(f"({TICKER_SYMBOL})", style={"fontWeight": 400, "fontSize": "26px", "color": COLOR_TEXT_MUTED}),
+                                    html.Span(id="company-name", style={"fontWeight": 800, "fontSize": "26px"}),
+                                    html.Span(" "),
+                                    html.Span(id="company-ticker", style={"fontWeight": 400, "fontSize": "26px", "color": COLOR_TEXT_MUTED}),
                                 ]
                             ),
                             html.Div(
-                                [
-                                    html.Span("● ", style={"color": COLOR_POSITIVE, "fontSize": "10px"}),
-                                    html.Span("LIVE", style={"color": COLOR_POSITIVE, "fontWeight": 700, "fontSize": "12px"}),
-                                    html.Span(f"  ·  {EXCHANGE_NAME}", style={"color": COLOR_TEXT_MUTED, "fontSize": "12px"}),
-                                ],
+                                id="live-status-1",
                                 style={"marginTop": "4px"},
                             ),
                         ]
@@ -197,7 +239,7 @@ def build_app():
                                 ]
                             ),
                             html.Div(
-                                f"LIVE · {EXCHANGE_NAME}",
+                                id="live-status-2",
                                 style={"fontSize": "12px", "color": COLOR_TEXT_MUTED, "marginTop": "4px"},
                             ),
                         ],
@@ -237,7 +279,7 @@ def build_app():
                                 children=[
                                     html.Div(
                                         [
-                                            html.Span(TICKER_SYMBOL, style={"fontWeight": 700, "fontSize": "13px"}),
+                                            html.Span(id="chart-ticker-label", style={"fontWeight": 700, "fontSize": "13px"}),
                                             html.Span(id="chart-subtitle", style={"color": COLOR_TEXT_MUTED, "fontSize": "13px", "marginLeft": "8px"}),
                                         ]
                                     ),
@@ -245,6 +287,7 @@ def build_app():
                                         style={"display": "flex", "gap": "4px", "alignItems": "center"},
                                         children=[
                                             _pill("1D", active=True),
+                                            _pill("5D", active=True),
                                             html.Div(style={"width": "8px"}),
                                             _pill("Line", active=True),
                                         ],
@@ -287,7 +330,10 @@ def build_app():
                                     "border": f"1px solid {COLOR_BORDER}",
                                 },
                                 children=[
-                                    html.Div("Welcome to the Stock Dashboard!", style={"fontSize": "13px", "fontWeight": 700, "opacity": "0.85"}),
+                                    html.Div("Welcome to the Stock Dashboard!" + "\n" + "\n", style={"fontSize": "13px", "fontWeight": 700, "opacity": "0.85"}),
+                                    html.Div("Here you can find the latest stock prices for your favourite stocks via the yfinance API", 
+                                             style={"fontSize": "11px", "fontWeight": 400, "opacity": "0.85"}
+                                    ),
                                 ],
                             ),
                             # Overview card (kept as its own box)
@@ -302,7 +348,7 @@ def build_app():
                                     "height": "fit-content",
                                 },
                                 children=[
-                                    html.Div("Overview", style={"fontSize": "13px", "fontWeight": 700, "opacity": "0.85", "marginBottom": "8px"}),
+                                    html.Div("Overview", style={"fontSize": "20px", "fontWeight": 700, "opacity": "0.90", "marginBottom": "8px"}),
                                     html.Div(
                                         children=[
                                             _stat_row("Current Price", value_id="stat-current"),
@@ -321,12 +367,32 @@ def build_app():
     )
 
     @app.callback(
+        Output("company-name", "children"),
+        Output("company-ticker", "children"),
+        Output("chart-ticker-label", "children"),
+        Input("ticker-dropdown", "value"),
+    )
+    def on_ticker_change(selected_ticker):
+        # Re-point the subscriber's live subscription at the newly
+        # selected ticker's topic. If the subscriber isn't up yet
+        # (e.g. this fires during initial page load before the
+        # background thread finishes connecting) this just no-ops;
+        # the chart/stat callbacks below will simply show "Waiting
+        # for data..." until data for this ticker arrives.
+        switch_ticker(selected_ticker)
+
+        info = _ticker_display_info(selected_ticker)
+        return info["name"], f"({selected_ticker})", selected_ticker
+
+    @app.callback(
         Output("price-chart", "figure"),
         Output("chart-subtitle", "children"),
         Input("interval-component", "n_intervals"),
+        Input("ticker-dropdown", "value"),
     )
-    def update_chart(n_intervals):
-        dates, currents = data_store.get_data()
+    def update_chart(n_intervals, selected_ticker):
+        dates, currents = data_store.get_data(selected_ticker)
+        info = _ticker_display_info(selected_ticker)
 
         traces = [
             go.Scatter(
@@ -376,7 +442,7 @@ def build_app():
                     tickformat="%H:%M",
                 ),
                 yaxis=dict(
-                    title=f"Price ({'SGD' if EXCHANGE_NAME == 'SGX' else 'USD'})",
+                    title=f"Price ({info['currency']})",
                     gridcolor=COLOR_BORDER,
                     color=COLOR_TEXT_MUTED,
                 ),
@@ -395,13 +461,28 @@ def build_app():
         Output("stat-low", "children"),
         Output("summary-price", "children"),
         Output("summary-change", "children"),
+        Output("live-status-1", "children"),
+        Output("live-status-2", "children"),
         Input("interval-component", "n_intervals"),
+        Input("ticker-dropdown", "value"),
     )
-    def update_stats(n):
-        dates, currents = data_store.get_data()
+    def update_stats(n, selected_ticker):
+        dates, currents = data_store.get_data(selected_ticker)
+        is_live = data_store.get_is_live(selected_ticker)
+        info = _ticker_display_info(selected_ticker)
+        status_label, status_color = _status_label_and_color(bool(currents), is_live)
+
+        live_status_1 = [
+            html.Span("● ", style={"color": status_color, "fontSize": "10px"}),
+            html.Span(status_label, style={"color": status_color, "fontWeight": 700, "fontSize": "12px"}),
+            html.Span("  ·  ", style={"color": COLOR_TEXT_MUTED, "fontSize": "12px"}),
+            html.Span(info["exchange"], style={"color": COLOR_TEXT_MUTED, "fontSize": "12px"}),
+        ]
+        live_status_2 = f"{status_label} · {info['exchange']}"
+
         if not currents:
             waiting = html.Span("Waiting for data...", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px", "fontWeight": 400})
-            return "-", "-", "-", "-", "-", waiting
+            return "-", "-", "-", "-", "-", waiting, live_status_1, live_status_2
 
         current = currents[-1]
         open_price = currents[0]
@@ -418,7 +499,7 @@ def build_app():
             style={"color": color, "fontWeight": 700, "fontSize": "16px"},
         )
 
-        return fmt(current), fmt(open_price), fmt(high), fmt(low), fmt(current), change_component
+        return fmt(current), fmt(open_price), fmt(high), fmt(low), fmt(current), change_component, live_status_1, live_status_2
 
     return app
 

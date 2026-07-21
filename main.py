@@ -29,13 +29,20 @@ import threading
 
 from subscriber import run_subscriber
 from dashboard import run_dashboard
+from solace_common import AVAILABLE_TICKERS
 
 
 def start_subscriber_thread():
     # daemon=True means this thread is automatically killed when the
     # main program exits (e.g. Ctrl+C on the dashboard) — otherwise it
     # would keep the process alive in the background forever.
-    thread = threading.Thread(target=run_subscriber, daemon=True)
+    # Starts subscribed to the first ticker in AVAILABLE_TICKERS,
+    # matching the dashboard's default dropdown selection; the
+    # dashboard re-points the subscription via switch_ticker()
+    # whenever the user picks a different stock.
+    thread = threading.Thread(
+        target=run_subscriber, kwargs={"initial_ticker": AVAILABLE_TICKERS[0]}, daemon=True
+    )
     thread.start()
     return thread
 
