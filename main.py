@@ -1,43 +1,51 @@
 """
 main.py
 
-The single entry point for the whole project. Run this file — not the
-others directly — to start everything together:
+Entry point for the RECEIVING side of the project: the subscriber and
+the dashboard. Run this file to start both together:
 
     python3 main.py
 
 What it does:
-1. Starts stock_price_streamer.run_streamer() on a background thread.
-   This connects to Solace, publishes rows from the stock dataset,
-   receives them back, and writes each data point into data_store.
+1. Starts subscriber.run_subscriber() on a background thread. This
+   connects to Solace, subscribes to the stock ticks topic, and
+   writes each received data point into data_store.
 2. Starts dashboard.run_dashboard() on the main thread. This runs the
    Dash web server, which reads from the SAME data_store on a timer
    and redraws the live chart.
 
 Both sides share one process, so they share one data_store instance
 in memory — see data_store.py for why that matters.
+
+NOTE: the publisher is a separate, standalone script now — see
+publisher.py. Run it independently, on this machine or any other,
+as long as it points (via the SOLACE_* env vars) at the same broker
+this subscriber is connected to:
+
+    python3 publisher.py
 """
 
 import threading
 
-from stock_price_streamer import run_streamer
+from subscriber import run_subscriber
 from dashboard import run_dashboard
 
 
-def start_streamer_thread():
+def start_subscriber_thread():
     # daemon=True means this thread is automatically killed when the
     # main program exits (e.g. Ctrl+C on the dashboard) — otherwise it
     # would keep the process alive in the background forever.
-    thread = threading.Thread(target=run_streamer, daemon=True)
+    thread = threading.Thread(target=run_subscriber, daemon=True)
     thread.start()
     return thread
 
 
 if __name__ == "__main__":
-    print("Starting Solace streamer on a background thread...")
-    start_streamer_thread()
+    print("Starting Solace subscriber on a background thread...")
+    start_subscriber_thread()
 
     print("Starting dashboard at http://127.0.0.1:8050 ...")
+    print("(Remember: run publisher.py separately to actually feed it data)")
     # This call blocks — it runs the Dash server until you stop the
     # program. Nothing after this line will execute.
     run_dashboard()

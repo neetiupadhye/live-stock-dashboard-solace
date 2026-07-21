@@ -1,11 +1,21 @@
 """
 dashboard.py
 
-A live-updating Dash dashboard that plots the stock's current price
-over time, reading from the shared data_store as new data arrives.
+A live-updating Dash dashboard styled after the "Market Insight" trading
+UI reference: dark theme, top nav bar, big price header, chart card with
+timeframe/chart-type controls, and a sidebar stats panel.
 
 This file only READS from data_store — it never writes to it.
-The writing happens in stock_price_streamer.py.
+The writing happens in subscriber.py.
+
+Honesty note on data: the reference mockup shows fields this pipeline
+doesn't actually have (Volume, Market Cap, 52-Week range, P/E, Div
+Yield, Order Book, multi-timeframe history). Rather than fabricate
+numbers for those, this dashboard shows them as "N/A" and disables the
+controls (timeframes other than 1D, candlestick view) that would need
+data we don't collect. Only Current Price, Open, High, and Low are
+computed from real ticks in data_store, plus a moving average line
+computed from that same real data.
 """
 
 from dash import Dash, dcc, html, Output, Input
@@ -13,61 +23,410 @@ import plotly.graph_objs as go
 
 from data_store import data_store
 
+# --- Config -----------------------------------------------------------
+
 # How often the chart redraws itself, in milliseconds.
-# 1000 = redraw once per second.
 REFRESH_INTERVAL_MS = 1000
+
+COMPANY_NAME = "DBS GROUP HOLDINGS"
+TICKER_SYMBOL = "D05.SI"
+EXCHANGE_NAME = "SGX"
+
+MOVING_AVERAGE_WINDOW = 10  # in data points, not minutes
+
+# --- Palette (matches the reference design) ----------------------------
+
+COLOR_BG = "#0a0e14"
+COLOR_NAVBAR_BG = "#0d1218"
+COLOR_CARD_BG = "#0f1720"
+COLOR_BORDER = "rgba(255,255,255,0.06)"
+COLOR_TEXT = "#e5e7eb"
+COLOR_TEXT_MUTED = "rgba(229,231,235,0.55)"
+COLOR_ACCENT_BLUE = "#3b82f6"
+COLOR_ACCENT_BLUE_SOFT = "rgba(59,130,246,0.15)"
+COLOR_POSITIVE = "#22c55e"
+COLOR_NEGATIVE = "#ef4444"
+COLOR_LINE = "#3b82f6"
+COLOR_MA_LINE = "#e5e7eb"
+COLOR_PILL_BG = "#1a2330"
+COLOR_PILL_BG_DISABLED = "#141c26"
+
+
+def _pill(label, active=False):
+    """A small timeframe/tool pill button, styled but non-interactive
+    for options we don't have the data to actually support."""
+    return html.Div(
+        label,
+        style={
+            "padding": "6px 12px",
+            "borderRadius": "6px",
+            "fontSize": "12px",
+            "fontWeight": 700 if active else 500,
+            "backgroundColor": COLOR_PILL_BG if active else "transparent",
+            "color": COLOR_TEXT if active else COLOR_TEXT_MUTED,
+            "cursor": "default" if active else "not-allowed",
+            "opacity": 1 if active else 0.45,
+            "userSelect": "none",
+        },
+        title="Live" if active else "Requires historical data this feed doesn't provide",
+    )
+
+
+def _stat_row(label, value_id=None, static_value=None, muted=False):
+    """One row in the sidebar Overview panel. Either bound to a
+    callback output (value_id) or a static placeholder (static_value)."""
+    value_child = (
+        html.Span(id=value_id, style={"float": "right", "fontWeight": 700, "color": COLOR_TEXT})
+        if value_id
+        else html.Span(
+            static_value,
+            style={"float": "right", "color": COLOR_TEXT_MUTED if muted else COLOR_TEXT, "fontWeight": 500},
+        )
+    )
+    return html.Div(
+        [label, value_child],
+        style={
+            "padding": "9px 0",
+            "borderBottom": f"1px solid {COLOR_BORDER}",
+            "fontSize": "13px",
+            "color": COLOR_TEXT_MUTED,
+        },
+    )
 
 
 def build_app():
     app = Dash(__name__)
 
-    app.layout = html.Div([
-        html.H2("Live Stock Current Price"),
+    app.layout = html.Div(
+        style={
+            "backgroundColor": COLOR_BG,
+            "minHeight": "100vh",
+            "color": COLOR_TEXT,
+            "fontFamily": "Inter, -apple-system, Arial, sans-serif",
+        },
+        children=[
+            # --- Top nav bar ---------------------------------------------
+            html.Div(
+                style={
+                    "backgroundColor": COLOR_NAVBAR_BG,
+                    "padding": "14px 28px",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "space-between",
+                    "borderBottom": f"1px solid {COLOR_BORDER}",
+                },
+                children=[
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "6px"},
+                        children=[
+                            html.Div("MARKET", style={"fontWeight": 800, "letterSpacing": "1px", "color": COLOR_TEXT}),
+                            html.Div("INSIGHT", style={"opacity": "0.6", "color": COLOR_TEXT, "fontWeight": 500}),
+                        ],
+                    ),
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "28px"},
+                        children=[
+                            html.Div(
+                                "Dashboard",
+                                style={
+                                    "color": COLOR_ACCENT_BLUE,
+                                    "fontSize": "14px",
+                                    "fontWeight": 600,
+                                    "paddingBottom": "4px",
+                                    "borderBottom": f"2px solid {COLOR_ACCENT_BLUE}",
+                                },
+                            ),
+                            html.Div("Markets", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px"}),
+                            html.Div("Portfolio", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px"}),
+                            html.Div("News", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px"}),
+                            html.Div(
+                                style={
+                                    "width": "34px",
+                                    "height": "34px",
+                                    "borderRadius": "50%",
+                                    "backgroundColor": "#2a3644",
+                                    "display": "flex",
+                                    "alignItems": "center",
+                                    "justifyContent": "center",
+                                    "fontSize": "13px",
+                                    "fontWeight": 700,
+                                    "color": COLOR_TEXT,
+                                },
+                                children="U",
+                            ),
+                        ],
+                    ),
+                ],
+            ),
 
-        dcc.Graph(id="price-chart"),
+            # --- Header: name + live badge / big price + change ----------
+            html.Div(
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "flex-end",
+                    "padding": "24px 28px 0 28px",
+                },
+                children=[
+                    html.Div(
+                        children=[
+                            html.Div(
+                                [
+                                    html.Span(COMPANY_NAME + " ", style={"fontWeight": 800, "fontSize": "26px"}),
+                                    html.Span(f"({TICKER_SYMBOL})", style={"fontWeight": 400, "fontSize": "26px", "color": COLOR_TEXT_MUTED}),
+                                ]
+                            ),
+                            html.Div(
+                                [
+                                    html.Span("● ", style={"color": COLOR_POSITIVE, "fontSize": "10px"}),
+                                    html.Span("LIVE", style={"color": COLOR_POSITIVE, "fontWeight": 700, "fontSize": "12px"}),
+                                    html.Span(f"  ·  {EXCHANGE_NAME}", style={"color": COLOR_TEXT_MUTED, "fontSize": "12px"}),
+                                ],
+                                style={"marginTop": "4px"},
+                            ),
+                        ]
+                    ),
+                    html.Div(
+                        style={"textAlign": "right"},
+                        children=[
+                            html.Div(
+                                [
+                                    html.Span(id="summary-price", style={"fontSize": "30px", "fontWeight": 800}),
+                                    html.Span(" "),
+                                    html.Span(id="summary-change"),
+                                ]
+                            ),
+                            html.Div(
+                                f"LIVE · {EXCHANGE_NAME}",
+                                style={"fontSize": "12px", "color": COLOR_TEXT_MUTED, "marginTop": "4px"},
+                            ),
+                        ],
+                    ),
+                ],
+            ),
 
-        # This invisible component just fires a timer tick every
-        # REFRESH_INTERVAL_MS — that tick is what triggers the
-        # callback below to redraw the chart.
-        dcc.Interval(id="interval-component", interval=REFRESH_INTERVAL_MS, n_intervals=0)
-    ])
+            # --- Main content: chart card + sidebar -----------------------
+            html.Div(
+                style={
+                    "display": "flex",
+                    "gap": "24px",
+                    "padding": "20px 28px 28px 28px",
+                    "alignItems": "flex-start",
+                },
+                children=[
+                    # Left: chart card
+                    html.Div(
+                        style={
+                            "flex": "1 1 0",
+                            "backgroundColor": COLOR_CARD_BG,
+                            "padding": "18px 20px",
+                            "borderRadius": "14px",
+                            "border": f"1px solid {COLOR_BORDER}",
+                            "boxShadow": "0 8px 30px rgba(0,0,0,0.5)",
+                        },
+                        children=[
+                            html.Div(
+                                style={
+                                    "display": "flex",
+                                    "justifyContent": "space-between",
+                                    "alignItems": "center",
+                                    "marginBottom": "14px",
+                                    "flexWrap": "wrap",
+                                    "gap": "10px",
+                                },
+                                children=[
+                                    html.Div(
+                                        [
+                                            html.Span(TICKER_SYMBOL, style={"fontWeight": 700, "fontSize": "13px"}),
+                                            html.Span(id="chart-subtitle", style={"color": COLOR_TEXT_MUTED, "fontSize": "13px", "marginLeft": "8px"}),
+                                        ]
+                                    ),
+                                    html.Div(
+                                        style={"display": "flex", "gap": "4px", "alignItems": "center"},
+                                        children=[
+                                            _pill("1D", active=True),
+                                            html.Div(style={"width": "8px"}),
+                                            _pill("Line", active=True),
+                                        ],
+                                    ),
+                                ],
+                            ),
+                            dcc.Graph(
+                                id="price-chart",
+                                config={"displayModeBar": False},
+                                style={"height": "560px", "width": "100%"},
+                            ),
+                            dcc.Interval(
+                                id="interval-component",
+                                interval=REFRESH_INTERVAL_MS,
+                                n_intervals=0,
+                            ),
+                            html.Div(
+                                "Disclaimer: Data is provided by Yahoo Finance and other content providers and may be delayed as specified by financial exchanges or other data providers",
+                                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED, "marginTop": "10px"},
+                            ),
+                        ],
+                    ),
+
+                    # Right: sidebar with stats (split into two separate boxes)
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "flexDirection": "column",
+                            "gap": "12px",
+                        },
+                        children=[
+                            # Separate small box for "test 123"
+                            html.Div(
+                                style={
+                                    "width": "300px",
+                                    "minWidth": "240px",
+                                    "backgroundColor": COLOR_CARD_BG,
+                                    "padding": "12px 16px",
+                                    "borderRadius": "14px",
+                                    "border": f"1px solid {COLOR_BORDER}",
+                                },
+                                children=[
+                                    html.Div("Welcome to the Stock Dashboard!", style={"fontSize": "13px", "fontWeight": 700, "opacity": "0.85"}),
+                                ],
+                            ),
+                            # Overview card (kept as its own box)
+                            html.Div(
+                                style={
+                                    "width": "300px",
+                                    "minWidth": "240px",
+                                    "backgroundColor": COLOR_CARD_BG,
+                                    "padding": "18px 20px",
+                                    "borderRadius": "14px",
+                                    "border": f"1px solid {COLOR_BORDER}",
+                                    "height": "fit-content",
+                                },
+                                children=[
+                                    html.Div("Overview", style={"fontSize": "13px", "fontWeight": 700, "opacity": "0.85", "marginBottom": "8px"}),
+                                    html.Div(
+                                        children=[
+                                            _stat_row("Current Price", value_id="stat-current"),
+                                            _stat_row("Open", value_id="stat-open"),
+                                            _stat_row("High", value_id="stat-high"),
+                                            _stat_row("Low", value_id="stat-low"),
+                                        ]
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
 
     @app.callback(
         Output("price-chart", "figure"),
-        Input("interval-component", "n_intervals")
+        Output("chart-subtitle", "children"),
+        Input("interval-component", "n_intervals"),
     )
     def update_chart(n_intervals):
         dates, currents = data_store.get_data()
 
-        figure = go.Figure(
-            data=[
+        traces = [
+            go.Scatter(
+                x=dates,
+                y=currents,
+                mode="lines",
+                name="Price",
+                line=dict(color=COLOR_LINE, width=2.5),
+                hovertemplate="%{x|%H:%M}<br>$%{y:.2f}<extra></extra>",
+            )
+        ]
+
+        # Moving average overlay, computed from real ticks we actually
+        # have — mirrors the reference's MA line without fabricating data.
+        if len(currents) >= MOVING_AVERAGE_WINDOW:
+            ma_values = []
+            window_sum = sum(currents[:MOVING_AVERAGE_WINDOW])
+            for i in range(len(currents)):
+                if i < MOVING_AVERAGE_WINDOW - 1:
+                    ma_values.append(None)
+                    continue
+                if i >= MOVING_AVERAGE_WINDOW:
+                    window_sum += currents[i] - currents[i - MOVING_AVERAGE_WINDOW]
+                ma_values.append(window_sum / MOVING_AVERAGE_WINDOW)
+            traces.append(
                 go.Scatter(
                     x=dates,
-                    y=currents,
+                    y=ma_values,
                     mode="lines",
-                    name="Current Price"
+                    name=f"{MOVING_AVERAGE_WINDOW}-pt MA",
+                    line=dict(color=COLOR_MA_LINE, width=1.5, dash="dot"),
+                    hoverinfo="skip",
                 )
-            ],
-            layout=go.Layout(
-                xaxis_title="Market Time",   # this is the actual timestamp of each price bar, not when we polled for it — the two can differ by a few minutes
-                yaxis_title="Current Price",
-                margin=dict(l=40, r=20, t=20, b=40)
             )
+
+        figure = go.Figure(
+            data=traces,
+            layout=go.Layout(
+                margin=dict(l=50, r=20, t=10, b=40),
+                plot_bgcolor=COLOR_CARD_BG,
+                paper_bgcolor=COLOR_CARD_BG,
+                font=dict(color=COLOR_TEXT),
+                xaxis=dict(
+                    title="Time",
+                    gridcolor=COLOR_BORDER,
+                    color=COLOR_TEXT_MUTED,
+                    tickformat="%H:%M",
+                ),
+                yaxis=dict(
+                    title=f"Price ({'SGD' if EXCHANGE_NAME == 'SGX' else 'USD'})",
+                    gridcolor=COLOR_BORDER,
+                    color=COLOR_TEXT_MUTED,
+                ),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
+            ),
         )
-        return figure
+
+        subtitle = dates[-1][:10] if dates else "Waiting for data..."
+        return figure, subtitle
+
+    @app.callback(
+        Output("stat-current", "children"),
+        Output("stat-open", "children"),
+        Output("stat-high", "children"),
+        Output("stat-low", "children"),
+        Output("summary-price", "children"),
+        Output("summary-change", "children"),
+        Input("interval-component", "n_intervals"),
+    )
+    def update_stats(n):
+        dates, currents = data_store.get_data()
+        if not currents:
+            waiting = html.Span("Waiting for data...", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px", "fontWeight": 400})
+            return "-", "-", "-", "-", "-", waiting
+
+        current = currents[-1]
+        open_price = currents[0]
+        high = max(currents)
+        low = min(currents)
+        fmt = lambda v: f"${v:,.2f}"
+
+        diff = current - open_price
+        pct = (diff / open_price * 100) if open_price else 0.0
+        sign = "+" if diff >= 0 else "-"
+        color = COLOR_POSITIVE if diff >= 0 else COLOR_NEGATIVE
+        change_component = html.Span(
+            f"{sign}{abs(diff):.2f} ({sign}{abs(pct):.2f}%)",
+            style={"color": color, "fontWeight": 700, "fontSize": "16px"},
+        )
+
+        return fmt(current), fmt(open_price), fmt(high), fmt(low), fmt(current), change_component
 
     return app
 
 
 def run_dashboard():
     app = build_app()
-    # debug=False is important here since this will run inside a
-    # background-threaded setup later (main.py) — Dash's debug/reloader
-    # mode doesn't play well with that.
     app.run(debug=False)
 
 
 if __name__ == "__main__":
-    # Lets you test the dashboard on its own, even before data_store
-    # has any real data in it (chart will just be empty until then).
     run_dashboard()
