@@ -16,6 +16,12 @@ controls (timeframes other than 1D, candlestick view) that would need
 data we don't collect. Only Current Price, Open, High, and Low are
 computed from real ticks in data_store, plus a moving average line
 computed from that same real data.
+
+Zoom: click-and-drag on the chart to box-zoom into a time range
+(Plotly's default drag behavior). Double-clicking inside the chart
+resets zoom back to the full view (native Plotly behavior).
+`uirevision` on the figure keeps the zoom stable across the 1s
+auto-refresh.
 """
 
 from dash import Dash, dcc, html, Output, Input
@@ -33,9 +39,6 @@ REFRESH_INTERVAL_MS = 1000
 # The ticker shown when the dashboard first loads — matches the topic
 # the subscriber starts subscribed to (see main.py).
 DEFAULT_TICKER = AVAILABLE_TICKERS[0]
-
-MOVING_AVERAGE_WINDOW = 10  # in data points, not minutes
-
 
 def _ticker_display_info(ticker_symbol):
     """Look up display name/exchange/currency for a ticker, with a
@@ -74,7 +77,6 @@ COLOR_ACCENT_BLUE_SOFT = "rgba(59,130,246,0.15)"
 COLOR_POSITIVE = "#22c55e"
 COLOR_NEGATIVE = "#ef4444"
 COLOR_LINE = "#3b82f6"
-COLOR_MA_LINE = "#e5e7eb"
 COLOR_PILL_BG = "#1a2330"
 COLOR_PILL_BG_DISABLED = "#141c26"
 
@@ -304,6 +306,7 @@ def build_app():
                                 interval=REFRESH_INTERVAL_MS,
                                 n_intervals=0,
                             ),
+
                             html.Div(
                                 "Disclaimer: Data is provided by Yahoo Finance and other content providers and may be delayed as specified by financial exchanges or other data providers",
                                 style={"fontSize": "11px", "color": COLOR_TEXT_MUTED, "marginTop": "10px"},
@@ -405,33 +408,17 @@ def build_app():
             )
         ]
 
-        # Moving average overlay, computed from real ticks we actually
-        # have — mirrors the reference's MA line without fabricating data.
-        if len(currents) >= MOVING_AVERAGE_WINDOW:
-            ma_values = []
-            window_sum = sum(currents[:MOVING_AVERAGE_WINDOW])
-            for i in range(len(currents)):
-                if i < MOVING_AVERAGE_WINDOW - 1:
-                    ma_values.append(None)
-                    continue
-                if i >= MOVING_AVERAGE_WINDOW:
-                    window_sum += currents[i] - currents[i - MOVING_AVERAGE_WINDOW]
-                ma_values.append(window_sum / MOVING_AVERAGE_WINDOW)
-            traces.append(
-                go.Scatter(
-                    x=dates,
-                    y=ma_values,
-                    mode="lines",
-                    name=f"{MOVING_AVERAGE_WINDOW}-pt MA",
-                    line=dict(color=COLOR_MA_LINE, width=1.5, dash="dot"),
-                    hoverinfo="skip",
-                )
-            )
-
         figure = go.Figure(
             data=traces,
             layout=go.Layout(
-                margin=dict(l=50, r=20, t=10, b=40),
+                # Keeps any zoom/pan the user has done in place across the
+                # 1s interval refreshes. Plotly only preserves zoom state
+                # between re-renders when uirevision stays the same value;
+                # tying it to the ticker means switching tickers still
+                # resets to the full view (new data), but repeated redraws
+                # of the *same* ticker won't fight the user's zoom.
+                uirevision=selected_ticker,
+                margin=dict(l=50, r=50, t=10, b=40),
                 plot_bgcolor=COLOR_CARD_BG,
                 paper_bgcolor=COLOR_CARD_BG,
                 font=dict(color=COLOR_TEXT),
@@ -445,11 +432,44 @@ def build_app():
                     title=f"Price ({info['currency']})",
                     gridcolor=COLOR_BORDER,
                     color=COLOR_TEXT_MUTED,
+                    side="right",
+                    automargin=True,
                 ),
                 hovermode="x unified",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
             ),
         )
+
+        if currents:
+            day_high = max(currents)
+            day_low = min(currents)
+            last_price = currents[-1]
+
+            for value, color in (
+                (day_high, COLOR_POSITIVE),
+                (day_low, COLOR_NEGATIVE),
+                (last_price, COLOR_TEXT),
+            ):
+                figure.add_hline(
+                    y=value,
+                    line=dict(color=color, width=2, dash="dash"),
+                )
+                figure.add_annotation(
+                    xref="paper",
+                    x=1.0,
+                    xanchor="left",
+                    y=value,
+                    yref="y",
+                    yanchor="middle",
+                    text=f"{value:.2f}",
+                    showarrow=False,
+                    bgcolor=color,
+                    font=dict(color=COLOR_BG, size=10, family="Roboto, Helvetica Neue, Arial, sans-serif"),
+                    borderpad=3,
+                    )
+        
+        subtitle = dates[-1][:10] if dates else "Waiting for data..."
+        return figure, subtitle
 
         subtitle = dates[-1][:10] if dates else "Waiting for data..."
         return figure, subtitle

@@ -9,28 +9,28 @@ The project demonstrates an end-to-end event-driven architecture: a standalone p
 ## Architecture
 
 ```
-┌─────────────────┐      ┌───────────────────┐          ┌─────────────────┐
-│  Yahoo Finance  │      │   Solace PubSub+  │          │  Dash Web App   │
-│  (yfinance API) │      │   Event Broker    │          │ (localhost:8050)│
-└────────┬────────┘      └─────────┬─────────┘          └───────┬─────────┘
-         │ poll every 15s          │                            │
-         ▼                         │                            │
-┌──────────────────┐   publish     │                            │
-│  publisher.py    ├───────────────►                            │
-│  (standalone     │  backfill     │                            │
-│   process)       │◄ requests ────┤                            │
-└──────────────────┘               │                            │
-                                   │  subscribe                 │
-                      ┌────────────┴─────────┐                  │
-                      │   subscriber.py      │                  │
-                      │ (one topic at a time)│                  │
-                      └───────────┬──────────┘                  │
-                                  │ write                       │
-                                  ▼                             │
+┌─────────────────┐      ┌───────────────────┐      ┌─────────────────┐
+│  Yahoo Finance  │      │   Solace PubSub+  │      │  Dash Web App   │
+│  (yfinance API) │      │   Event Broker    │      │ (localhost:8050)│
+└────────┬────────┘      └─────────┬─────────┘      └───────┬─────────┘
+         │ poll every 15s          │                        │
+         ▼                         │                        │
+┌──────────────────┐   publish     │                        │
+│  publisher.py     ├───────────────►                        │
+│  (standalone      │  backfill      │                        │
+│   process)         │◄ requests ────┤                        │
+└──────────────────┘                │                        │
+                                     │  subscribe             │
+                        ┌────────────┴─────────┐              │
+                        │   subscriber.py       │              │
+                        │  (one topic at a time) │              │
+                        └───────────┬───────────┘              │
+                                    │ write                     │
+                                    ▼                           │
                         ┌──────────────────┐   read (1x/sec)    │
-                        │   data_store.py  ├────────────────────►
-                        │ (thread-safe,    │                dashboard.py
-                        │  per-ticker)     │
+                        │   data_store.py   ├────────────────────►
+                        │ (thread-safe,     │                dashboard.py
+                        │  per-ticker)       │
                         └──────────────────┘
 ```
 
