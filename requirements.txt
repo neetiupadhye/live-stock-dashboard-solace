@@ -1,5 +1,5 @@
 dash
 plotly
 solace-pubsubplus
-datasets
+yfinance 
 pandas
