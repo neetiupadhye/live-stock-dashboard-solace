@@ -280,7 +280,7 @@ def build_app():
                     "display": "flex",
                     "gap": "24px",
                     "padding": "20px 28px 28px 28px",
-                    "alignItems": "flex-start",
+                    "alignItems": "stretch",
                 },
                 children=[
                     # Left: chart card
@@ -292,6 +292,8 @@ def build_app():
                             "borderRadius": "14px",
                             "border": f"1px solid {COLOR_BORDER}",
                             "boxShadow": "0 8px 30px rgba(0,0,0,0.5)",
+                            "display": "flex",
+                            "flexDirection": "column",
                         },
                         children=[
                             html.Div(
@@ -302,6 +304,7 @@ def build_app():
                                     "marginBottom": "14px",
                                     "flexWrap": "wrap",
                                     "gap": "10px",
+                                    "flex": "0 0 auto",
                                 },
                                 children=[
                                     html.Div(
@@ -321,10 +324,23 @@ def build_app():
                                     ),
                                 ],
                             ),
-                            dcc.Graph(
-                                id="price-chart",
-                                config={"displayModeBar": False},
-                                style={"height": "560px", "width": "100%"},
+                            html.Div(
+                                # This wrapper is what actually grows to fill
+                                # the leftover vertical space in the card
+                                # (now that the card itself is stretched to
+                                # match the sidebar's height). minHeight: 0
+                                # is required here — without it, a flex
+                                # child won't shrink below its content size,
+                                # which would defeat the flex-grow above and
+                                # let the graph overflow instead of filling.
+                                style={"flex": "1 1 auto", "minHeight": "0"},
+                                children=[
+                                    dcc.Graph(
+                                        id="price-chart",
+                                        config={"displayModeBar": False},
+                                        style={"height": "100%", "width": "100%"},
+                                    ),
+                                ],
                             ),
                             dcc.Interval(
                                 id="interval-component",
@@ -334,7 +350,7 @@ def build_app():
 
                             html.Div(
                                 "Disclaimer: Data is provided by Yahoo Finance and other content providers and may be delayed as specified by financial exchanges or other data providers",
-                                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED, "marginTop": "10px"},
+                                style={"fontSize": "11px", "color": COLOR_TEXT_MUTED, "marginTop": "10px", "flex": "0 0 auto"},
                             ),
                         ],
                     ),
@@ -350,8 +366,8 @@ def build_app():
                             # Separate small box for "test 123"
                             html.Div(
                                 style={
-                                    "width": "300px",
-                                    "minWidth": "240px",
+                                    "width": "340px",
+                                    "minWidth": "280px",
                                     "backgroundColor": COLOR_CARD_BG,
                                     "padding": "18px 20px",
                                     "borderRadius": "14px",
@@ -362,7 +378,7 @@ def build_app():
                                     html.Div("Welcome to the Stock Dashboard", style={"fontSize": "20px", "fontWeight": 700, "opacity": "0.90", "marginBottom": "8px"}),
                                     html.Div(
                                         children=[
-                                            _stat_row("Powered by Yahoo Finance, Solace PubSub+ Brokers and Plotly Dash", static_value="", muted=True),
+                                            _stat_row("Here you can find the latest stock information and news.", value_id=""),
                                         ]
                                     ),
                                 ],
@@ -370,8 +386,8 @@ def build_app():
                             # Overview card (kept as its own box)
                             html.Div(
                                 style={
-                                    "width": "300px",
-                                    "minWidth": "240px",
+                                    "width": "340px",
+                                    "minWidth": "280px",
                                     "backgroundColor": COLOR_CARD_BG,
                                     "padding": "18px 20px",
                                     "borderRadius": "14px",
@@ -396,8 +412,8 @@ def build_app():
                             # This callback never touches yfinance itself.
                             html.Div(
                                 style={
-                                    "width": "300px",
-                                    "minWidth": "240px",
+                                    "width": "340px",
+                                    "minWidth": "280px",
                                     "backgroundColor": COLOR_CARD_BG,
                                     "padding": "18px 20px",
                                     "borderRadius": "14px",
