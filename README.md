@@ -9,33 +9,30 @@ The project demonstrates an end-to-end event-driven architecture: a standalone p
 ## Architecture
 
 ```
-┌─────────────────┐      ┌───────────────────┐      ┌─────────────────┐
-│  Yahoo Finance  │      │   Solace PubSub+  │      │  Dash Web App   │
-│  (yfinance API) │      │   Event Broker    │      │ (localhost:8050)│
-└────────┬────────┘      └─────────┬─────────┘      └───────┬─────────┘
-         │ poll every 15s          │                        │
-         ▼                         │                        │
-┌──────────────────┐   publish     │                        │
-│  publisher.py     ├───────────────►                        │
-│  (standalone      │  backfill      │                        │
-│   process)         │◄ requests ────┤                        │
-└──────────────────┘                │                        │
-                                     │  subscribe             │
-                        ┌────────────┴─────────┐              │
-                        │   subscriber.py       │              │
+┌─────────────────┐      ┌───────────────────┐      ┌─────────────────────┐
+│  Yahoo Finance  │      │   Solace PubSub+  │      │    Dash Web App     │
+│  (yfinance API) │      │   Event Broker    │      │   (localhost:8050)  │
+└────────┬────────┘      └─────────┬─────────┘      └───────────┬─────────┘
+         │ poll every 15s          │                            │
+         ▼                         │                            │
+┌──────────────────┐   publish     │                            │
+│  publisher.py    ├───────────────►                            │
+│  (standalone     │  backfill     │                            │
+│   process)       │◄ requests ────┤                            │
+└──────────────────┘               │                            │
+                                   │  subscribe                 │
+                        ┌──────────┴─────────────┐              │
+                        │   subscriber.py        │              │
                         │  (one topic at a time) │              │
-                        └───────────┬───────────┘              │
+                        └───────────┬────────────┘              │
                                     │ write                     │
                                     ▼                           │
                         ┌──────────────────┐   read (1x/sec)    │
-                        │   data_store.py   ├────────────────────►
-                        │ (thread-safe,     │                dashboard.py
-                        │  per-ticker)       │
+                        │   data_store.py  ├────────────────────►
+                        │ (thread-safe,    │                dashboard.py
+                        │  per-ticker)     │
                         └──────────────────┘
 ```
-
-*(Diagram shows the price-tick path; news flows through the same publisher → broker → subscriber → dashboard shape, one topic per ticker under `solace/samples/python/news/<TICKER>`, landing in a parallel `news_store.py` — see below.)*
-
 `main.py` wires together the **receiving** side of the pipeline: it starts `subscriber.py` on a background thread and runs the Dash server (`dashboard.py`) on the main thread. Both share a single `data_store` instance (and a single `news_store` instance) in memory, guarded by locks, so producer and consumer never race.
 
 `publisher.py` is a fully separate, standalone process — it can run on the same machine or a completely different one, as long as it points (via the `SOLACE_*` env vars) at the same broker the subscriber is connected to.
@@ -47,9 +44,10 @@ The project demonstrates an end-to-end event-driven architecture: a standalone p
 1. **`publisher.py`** polls Yahoo Finance every 15 seconds for the latest 1-minute price bar of every ticker in `AVAILABLE_TICKERS`, and publishes any new bar as a JSON message to that ticker's own Solace topic (`solace/samples/python/stocks/<TICKER>`). On startup it also replays each ticker's full day-so-far history so a dashboard opened mid-session isn't starting from an empty chart. Separately, on a much slower cadence (every 5 minutes by default), it also fetches each ticker's latest news via `yfinance` and publishes it to that ticker's own news topic (`solace/samples/python/news/<TICKER>`).
 2. **`subscriber.py`** connects to the same broker and subscribes to exactly **one** ticker's price topic **and** that same ticker's news topic at a time — whichever one the dashboard currently has selected — and routes each incoming message into the shared `data_store` or `news_store` depending on its shape.
 3. When you pick a different stock in the dashboard's dropdown, `subscriber.switch_ticker()` re-points both the live price and news subscriptions at the new ticker's topics **and** sends a backfill request to the publisher (on a separate request topic), asking it to replay that ticker's day-so-far price history *and* refresh its news. This gives every stock the same "full history, then live" experience the first ticker gets at startup, instead of building the chart (or news box) up from scratch on whatever happens to arrive after you switched to it.
-4. **`data_store.py`** keeps a separate, bounded series of price points per ticker (not just the one currently selected), so switching back to a stock you looked at earlier doesn't lose what was already collected for it. **`news_store.py`** does the same for news, keeping the latest fetched article list per ticker.
-5. **`dashboard.py`** runs a Dash app styled as a dark-themed trading UI. It polls `data_store` and `news_store` once per second for the selected ticker and redraws the live price chart, Current/Open/High/Low stats, a moving-average overlay, and a Latest News sidebar box — all sourced from real data already sitting in the local stores. Fields the data doesn't actually support (Volume, Market Cap, 52-Week range, P/E, multi-timeframe candles, etc.) are shown as "N/A" or disabled rather than faked.
-6. **`main.py`** is the entry point for the receiving side — it starts the subscriber on a background thread and then blocks on the Dash server. The publisher is started separately.
+4. **`data_store.py`** keeps a separate, bounded series of price points per ticker (not just the one currently selected), so switching back to a stock you looked at earlier doesn't lose what was already collected for it.
+5. **`news_store.py`** does the same for news what **data_store.py** does for price data, keeping the latest fetched article list per ticker.
+6. **`dashboard.py`** runs a Dash app styled as a dark-themed trading UI. It polls `data_store` and `news_store` once per second for the selected ticker and redraws the live price chart, Current/Open/High/Low stats, a moving-average overlay, and a Latest News sidebar box — all sourced from real data already sitting in the local stores. Fields the data doesn't actually support (Volume, Market Cap, 52-Week range, P/E, multi-timeframe candles, etc.) are shown as "N/A" or disabled rather than faked.
+7. **`main.py`** is the entry point for the receiving side — it starts the subscriber on a background thread and then blocks on the Dash server. The publisher is started separately.
 
 This publish → receive → store path (rather than the dashboard reading Yahoo Finance directly) is intentional, for both price and news: it exercises the full pub/sub path end-to-end, the same pattern you'd use if the publisher and dashboard consumer were genuinely separate services on separate machines, and it keeps the dashboard's render path free of any network calls of its own.
 
