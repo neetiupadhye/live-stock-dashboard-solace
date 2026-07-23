@@ -46,10 +46,10 @@ The project demonstrates an end-to-end event-driven architecture: a standalone p
 2. **`subscriber.py`** connects to the same broker and subscribes to exactly **one** ticker's topic at a time — whichever one the dashboard currently has selected — and writes every received data point into the shared `data_store`.
 3. When you pick a different stock in the dashboard's dropdown, `subscriber.switch_ticker()` re-points the live subscription at the new ticker's topic **and** sends a backfill request to the publisher (on a separate request topic), asking it to replay that ticker's day-so-far history. This gives every stock the same "full history, then live" experience the first ticker gets at startup, instead of building the chart up from scratch on live ticks alone.
 4. **`data_store.py`** keeps a separate, bounded series of points per ticker (not just the one currently selected), so switching back to a stock you looked at earlier doesn't lose what was already collected for it.
-5. **`dashboard.py`** runs a Dash app styled as a dark-themed trading UI. It polls `data_store` once per second for the selected ticker and redraws the live price chart, plus Current/Open/High/Low stats and a moving-average overlay — all computed from real ticks. Fields the data doesn't actually support (Volume, Market Cap, 52-Week range, P/E, multi-timeframe candles, etc.) are shown as "N/A" or disabled rather than faked.
+5. **`dashboard.py`** runs a Dash app styled as a dark-themed trading UI. It polls `data_store` once per second for the selected ticker and redraws the live price chart, plus Current/Open/High/Low stats — all computed from real ticks.
 6. **`main.py`** is the entry point for the receiving side — it starts the subscriber on a background thread and then blocks on the Dash server. The publisher is started separately.
 
-This publish → receive → store path (rather than the dashboard reading Yahoo Finance directly) is intentional: it exercises the full pub/sub path end-to-end, the same pattern you'd use if the publisher and dashboard consumer were genuinely separate services on separate machines.
+This publish → receive → store path (rather than the dashboard reading Yahoo Finance directly) is intentional as it exercises the full pub/sub path end-to-end, to enable the publisher and dashboard consumer to be separate separate services on separate machines if needed.
 
 ---
 
