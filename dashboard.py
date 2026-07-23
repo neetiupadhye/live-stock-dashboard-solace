@@ -28,6 +28,7 @@ from dash import Dash, dcc, html, Output, Input
 import plotly.graph_objs as go
 
 from data_store import data_store
+from news_store import news_store
 from solace_common import AVAILABLE_TICKERS, TICKER_INFO
 from subscriber import switch_ticker
 
@@ -123,6 +124,33 @@ def _stat_row(label, value_id=None, static_value=None, muted=False):
     )
 
 
+def _news_item(article):
+    """One row in the sidebar Latest News list: a clickable headline
+    plus its publisher, styled to match the rest of the sidebar."""
+    return html.Div(
+        [
+            html.A(
+                article.get("title", "Untitled"),
+                href=article.get("link") or "#",
+                target="_blank",
+                style={
+                    "color": COLOR_TEXT,
+                    "fontSize": "13px",
+                    "fontWeight": 600,
+                    "textDecoration": "none",
+                    "lineHeight": "1.4",
+                    "display": "block",
+                },
+            ),
+            html.Div(
+                article.get("publisher", ""),
+                style={"color": COLOR_TEXT_MUTED, "fontSize": "11px", "marginTop": "4px"},
+            ),
+        ],
+        style={"padding": "10px 0", "borderBottom": f"1px solid {COLOR_BORDER}"},
+    )
+
+
 def build_app():
     app = Dash(__name__)
 
@@ -183,9 +211,6 @@ def build_app():
                                     "borderBottom": f"2px solid {COLOR_ACCENT_BLUE}",
                                 },
                             ),
-                            html.Div("Markets", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px"}),
-                            html.Div("Portfolio", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px"}),
-                            html.Div("News", style={"color": COLOR_TEXT_MUTED, "fontSize": "14px"}),
                             html.Div(
                                 style={
                                     "width": "34px",
@@ -328,14 +353,17 @@ def build_app():
                                     "width": "300px",
                                     "minWidth": "240px",
                                     "backgroundColor": COLOR_CARD_BG,
-                                    "padding": "12px 16px",
+                                    "padding": "18px 20px",
                                     "borderRadius": "14px",
                                     "border": f"1px solid {COLOR_BORDER}",
+                                    "height": "fit-content",
                                 },
                                 children=[
-                                    html.Div("Welcome to the Stock Dashboard!" + "\n" + "\n", style={"fontSize": "13px", "fontWeight": 700, "opacity": "0.85"}),
-                                    html.Div("Here you can find the latest stock prices for your favourite stocks via the yfinance API", 
-                                             style={"fontSize": "11px", "fontWeight": 400, "opacity": "0.85"}
+                                    html.Div("Welcome to the Stock Dashboard", style={"fontSize": "20px", "fontWeight": 700, "opacity": "0.90", "marginBottom": "8px"}),
+                                    html.Div(
+                                        children=[
+                                            _stat_row("Powered by Yahoo Finance, Solace PubSub+ Brokers and Plotly Dash", static_value="", muted=True),
+                                        ]
                                     ),
                                 ],
                             ),
@@ -360,6 +388,25 @@ def build_app():
                                             _stat_row("Low", value_id="stat-low"),
                                         ]
                                     ),
+                                ],
+                            ),
+                            # Latest News card — fed by news_store, which
+                            # is filled by subscriber.py over Solace, same
+                            # producer/consumer split as the price chart.
+                            # This callback never touches yfinance itself.
+                            html.Div(
+                                style={
+                                    "width": "300px",
+                                    "minWidth": "240px",
+                                    "backgroundColor": COLOR_CARD_BG,
+                                    "padding": "18px 20px",
+                                    "borderRadius": "14px",
+                                    "border": f"1px solid {COLOR_BORDER}",
+                                    "height": "fit-content",
+                                },
+                                children=[
+                                    html.Div("Latest News", style={"fontSize": "20px", "fontWeight": 700, "opacity": "0.90", "marginBottom": "10px"}),
+                                    html.Div(id="news-list"),
                                 ],
                             ),
                         ],
@@ -520,6 +567,21 @@ def build_app():
         )
 
         return fmt(current), fmt(open_price), fmt(high), fmt(low), fmt(current), change_component, live_status_1, live_status_2
+
+    @app.callback(
+        Output("news-list", "children"),
+        Input("interval-component", "n_intervals"),
+        Input("ticker-dropdown", "value"),
+    )
+    def update_news(n_intervals, selected_ticker):
+        # Pure local read — news_store is filled by subscriber.py over
+        # Solace (see publisher.py's periodic + backfill-triggered news
+        # publishing), so this never blocks on a network call itself,
+        # even though it rides the same 1s interval as the price chart.
+        articles = news_store.get(selected_ticker)
+        if not articles:
+            return html.Div("Waiting for news...", style={"color": COLOR_TEXT_MUTED, "fontSize": "13px"})
+        return [_news_item(article) for article in articles]
 
     return app
 

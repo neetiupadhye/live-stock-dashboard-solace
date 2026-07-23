@@ -32,6 +32,7 @@ import yfinance as yf
 from solace_common import (
     AVAILABLE_TICKERS,
     topic_for_ticker,
+    topic_for_news,
     BACKFILL_REQUEST_TOPIC_PREFIX,
     build_messaging_service,
     attach_service_listeners,
@@ -41,6 +42,14 @@ POLL_INTERVAL_SECONDS = 15   # 1-minute bars can't update faster than once a min
 # NOTE: this interval applies per poll cycle, and each cycle now polls
 # every ticker in AVAILABLE_TICKERS in turn. If you add a lot of
 # tickers and start seeing yfinance rate-limit errors, raise this.
+
+# News doesn't need per-tick freshness the way prices do, so it's
+# polled on its own, much slower cadence within the same main loop.
+NEWS_POLL_INTERVAL_SECONDS = 300   # 5 minutes
+
+# How many articles to keep per ticker per publish — keeps messages
+# small and the sidebar box from growing unbounded.
+NEWS_ARTICLES_PER_TICKER = 5
 
 # How recent a bar's own timestamp has to be, relative to wall-clock
 # now, to count as "live" rather than "last known price from a closed
@@ -107,6 +116,50 @@ def get_intraday_history(ticker_symbol):
     return quotes
 
 
+def get_latest_news(ticker_symbol):
+    """
+    Fetch the most recent news articles for a ticker via yfinance,
+    normalized down to just the fields the dashboard actually shows.
+
+    yfinance's .news shape has changed across versions (article fields
+    sometimes live directly on the item, sometimes nested under a
+    "content" key) — this normalizes both so the rest of the pipeline
+    doesn't need to care which one a given yfinance version returns.
+    """
+    ticker_obj = yf.Ticker(ticker_symbol)
+    raw_items = ticker_obj.news or []
+
+    articles = []
+    for item in raw_items[:NEWS_ARTICLES_PER_TICKER]:
+        content = item.get("content", item)  # newer yfinance nests fields under "content"
+
+        title = content.get("title")
+        if not title:
+            continue  # skip anything we can't even show a headline for
+
+        link = (
+            content.get("clickThroughUrl", {}).get("url")
+            or content.get("canonicalUrl", {}).get("url")
+            or item.get("link")
+            or ""
+        )
+        publisher_name = (
+            content.get("provider", {}).get("displayName")
+            or item.get("publisher")
+            or ""
+        )
+        published = content.get("pubDate") or content.get("displayTime") or ""
+
+        articles.append({
+            "title": title,
+            "link": link,
+            "publisher": publisher_name,
+            "published": published,
+        })
+
+    return articles
+
+
 class PublisherErrorHandling(PublishFailureListener):
     def on_failed_publish(self, e: "FailedPublishEvent"):
         print("on_failed_publish")
@@ -120,10 +173,17 @@ class BackfillRequestHandler(MessageHandler):
     day-so-far bars and republishes them on the normal data topic —
     the same get_intraday_history() + publish_quote() path used for
     the one-time startup backfill, just re-triggered on demand.
+
+    Also treats a backfill request as the signal to refresh that
+    ticker's news: switching to a stock is exactly the moment its news
+    is most likely to be stale (or missing, if this process is the
+    first one ever to look at it), so it gets a fresh fetch+publish
+    right away rather than waiting for the next periodic news cycle.
     """
 
-    def __init__(self, publish_quote_fn):
+    def __init__(self, publish_quote_fn, publish_news_fn):
         self._publish_quote = publish_quote_fn
+        self._publish_news = publish_news_fn
 
     def on_message(self, message: "InboundMessage"):
         try:
@@ -150,11 +210,16 @@ class BackfillRequestHandler(MessageHandler):
             history = get_intraday_history(ticker)
         except Exception as e:
             print(f"Error fetching backfill history for {ticker}: {e}")
-            return
+            history = []
 
         for quote in history:
             self._publish_quote(quote)
         print(f"Backfill replay complete for {ticker} ({len(history)} bars)")
+
+        try:
+            self._publish_news(ticker)
+        except Exception as e:
+            print(f"Error refreshing news for {ticker}: {e}")
 
 
 def run_publisher():
@@ -186,16 +251,34 @@ def run_publisher():
         )
         print(f"Published [{quote['ticker']}]: {quote['date']} -> {quote['current']}")
 
+    def publish_news(ticker):
+        nonlocal msg_seq_num
+        articles = get_latest_news(ticker)
+        msg_seq_num += 1
+        additional_properties = {APPLICATION_MESSAGE_ID: f"sample_id {msg_seq_num}"}
+        payload = json.dumps({
+            "ticker": ticker,
+            "articles": articles,
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        outbound_message = message_builder.build(payload, additional_message_properties=additional_properties)
+        direct_publisher.publish(
+            destination=Topic.of(topic_for_news(ticker)),
+            message=outbound_message,
+        )
+        print(f"Published [{ticker}] news: {len(articles)} article(s)")
+
     # Listens for on-demand backfill requests (see BackfillRequestHandler)
     # so a dashboard switching tickers can get the same "full day-so-far
-    # then live" treatment the very first ticker gets at startup.
+    # then live" treatment the very first ticker gets at startup — and,
+    # now, a fresh news fetch too.
     backfill_receiver = (
         messaging_service.create_direct_message_receiver_builder()
         .with_subscriptions([TopicSubscription.of(BACKFILL_REQUEST_TOPIC_PREFIX + "/>")])
         .build()
     )
     backfill_receiver.start()
-    backfill_receiver.receive_async(BackfillRequestHandler(publish_quote))
+    backfill_receiver.receive_async(BackfillRequestHandler(publish_quote, publish_news))
 
     try:
         print(f"Publishing {AVAILABLE_TICKERS} (one topic per ticker) every {POLL_INTERVAL_SECONDS}s...\n")
@@ -222,6 +305,17 @@ def run_publisher():
                     last_published_date[ticker] = quote["date"]
         print("Backfill complete. Switching to live polling.\n")
 
+        # --- Initial news: one fetch+publish per ticker at startup,
+        # same idea as the price backfill above, so a dashboard opened
+        # right away still has news to show instead of an empty box
+        # until the first NEWS_POLL_INTERVAL_SECONDS cycle completes.
+        for ticker in AVAILABLE_TICKERS:
+            try:
+                publish_news(ticker)
+            except Exception as e:
+                print(f"Error fetching initial news for {ticker}: {e}")
+        last_news_published_at = time.monotonic()
+
         # --- Live polling: each cycle, poll every ticker in turn and
         # publish only the ones with a new bar since last time.
         while True:
@@ -241,6 +335,19 @@ def run_publisher():
 
                 publish_quote(quote)
                 last_published_date[ticker] = quote["date"]
+
+            # News is polled on its own, much slower cadence than
+            # price — checked once per price-poll cycle rather than
+            # slept on separately, so one thread/loop covers both and
+            # a backfill-triggered refresh (see BackfillRequestHandler)
+            # can still happen in between these periodic ones.
+            if time.monotonic() - last_news_published_at >= NEWS_POLL_INTERVAL_SECONDS:
+                for ticker in AVAILABLE_TICKERS:
+                    try:
+                        publish_news(ticker)
+                    except Exception as e:
+                        print(f"Error fetching news for {ticker}: {e}")
+                last_news_published_at = time.monotonic()
 
             time.sleep(POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:

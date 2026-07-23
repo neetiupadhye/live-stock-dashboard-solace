@@ -2,10 +2,12 @@
 subscriber.py
 
 Standalone subscriber: connects to the Solace broker and subscribes
-to exactly ONE stock's topic at a time, writing every received data
-point into data_store. Which stock that is can be changed at runtime
-via switch_ticker() — that's what lets the dashboard's dropdown
-swap the live feed when the user picks a different stock.
+to exactly ONE stock's price topic and ONE stock's news topic at a
+time (always the same stock for both), writing every received data
+point into data_store or news_store depending on what kind of message
+it is. Which stock that is can be changed at runtime via
+switch_ticker() — that's what lets the dashboard's dropdown swap the
+live feed when the user picks a different stock.
 
 Switching (or the initial connect) also fires a backfill request at
 the publisher, asking it to replay that ticker's day-so-far history
@@ -36,21 +38,25 @@ from solace.messaging.receiver.message_receiver import MessageHandler
 from solace.messaging.receiver.inbound_message import InboundMessage
 
 from data_store import data_store
+from news_store import news_store
 from solace_common import (
     AVAILABLE_TICKERS,
     topic_for_ticker,
+    topic_for_news,
     backfill_request_topic,
     build_messaging_service,
     attach_service_listeners,
 )
 
-# The live Direct Receiver and which topic it's currently subscribed
-# to, plus a small Direct Publisher used only to send backfill
-# requests. Set once run_subscriber() starts; switch_ticker() below
-# mutates these under _subscription_lock, since it can be called from
-# the dashboard's callback thread while the receiver is running.
+# The live Direct Receiver and which topics it's currently subscribed
+# to (both price and news, for the same ticker), plus a small Direct
+# Publisher used only to send backfill requests. Set once
+# run_subscriber() starts; switch_ticker() below mutates these under
+# _subscription_lock, since it can be called from the dashboard's
+# callback thread while the receiver is running.
 _receiver = None
 _current_topic = None
+_current_news_topic = None
 _backfill_publisher = None
 _backfill_message_builder = None
 _subscription_lock = threading.Lock()
@@ -65,13 +71,20 @@ class MessageHandlerImpl(MessageHandler):
 
             data = json.loads(payload)
             # The ticker comes from the message payload itself, not
-            # the topic — this keeps data_store correct even for the
+            # the topic — this keeps the stores correct even for the
             # brief window during a switch_ticker() call where both
             # the old and new subscriptions might momentarily overlap.
-            data_store.add(data["ticker"], data["date"], data["current"], data.get("is_live", False))
+            ticker = data["ticker"]
 
-            status = "LIVE" if data.get("is_live", False) else "closed"
-            print(f"Stored [{data['ticker']}] ({status}): {data['date']} -> {data['current']}")
+            if "articles" in data:
+                # News message: {"ticker", "articles", "fetched_at"}
+                news_store.set(ticker, data["articles"], data.get("fetched_at"))
+                print(f"Stored [{ticker}] news: {len(data['articles'])} article(s)")
+            else:
+                # Price tick: {"ticker", "date", "current", "is_live", ...}
+                data_store.add(ticker, data["date"], data["current"], data.get("is_live", False))
+                status = "LIVE" if data.get("is_live", False) else "closed"
+                print(f"Stored [{ticker}] ({status}): {data['date']} -> {data['current']}")
 
         except Exception as e:
             print(f"Error processing message: {e}")
@@ -110,33 +123,42 @@ def switch_ticker(new_ticker):
     Returns True if the subscription is (now) on new_ticker's topic,
     False if the receiver isn't up yet.
     """
-    global _current_topic
+    global _current_topic, _current_news_topic
 
     with _subscription_lock:
         if _receiver is None:
             return False
 
         new_topic = topic_for_ticker(new_ticker)
+        new_news_topic = topic_for_news(new_ticker)
         if new_topic == _current_topic:
             return True  # already subscribed to this one
 
         try:
-            # Subscribe to the new topic BEFORE clearing/requesting,
-            # so we can't miss the backfill reply that's about to come
-            # back on it.
+            # Subscribe to both new topics BEFORE clearing/requesting,
+            # so we can't miss the backfill reply (price or news)
+            # that's about to come back on either of them.
             _receiver.add_subscription(TopicSubscription.of(new_topic))
+            _receiver.add_subscription(TopicSubscription.of(new_news_topic))
 
-            # Wipe any stale data left over from a previous visit to
-            # this ticker — the backfill reply is about to resend the
-            # full day-so-far, so keeping old points around would just
-            # duplicate them ahead of the fresh ones.
+            # Wipe any stale price data left over from a previous visit
+            # to this ticker — the backfill reply is about to resend
+            # the full day-so-far, so keeping old points around would
+            # just duplicate them ahead of the fresh ones. News is left
+            # alone (not cleared): a stale-but-present headline is a
+            # better sidebar experience than a flash of "no news" while
+            # the fresh fetch is in flight, and the incoming news
+            # message replaces it wholesale as soon as it arrives.
             data_store.clear(new_ticker)
             _request_backfill(new_ticker)
 
             if _current_topic is not None:
                 _receiver.remove_subscription(TopicSubscription.of(_current_topic))
+            if _current_news_topic is not None:
+                _receiver.remove_subscription(TopicSubscription.of(_current_news_topic))
             _current_topic = new_topic
-            print(f"Switched live subscription to: {new_topic}")
+            _current_news_topic = new_news_topic
+            print(f"Switched live subscription to: {new_topic} and {new_news_topic}")
             return True
         except PubSubPlusClientError as exception:
             print(f"Failed to switch subscription to {new_topic}: {exception}")
@@ -144,17 +166,18 @@ def switch_ticker(new_ticker):
 
 
 def run_subscriber(initial_ticker=None):
-    global _receiver, _current_topic, _backfill_publisher, _backfill_message_builder
+    global _receiver, _current_topic, _current_news_topic, _backfill_publisher, _backfill_message_builder
 
     initial_ticker = initial_ticker or AVAILABLE_TICKERS[0]
     initial_topic = topic_for_ticker(initial_ticker)
+    initial_news_topic = topic_for_news(initial_ticker)
 
     messaging_service = build_messaging_service()
     attach_service_listeners(messaging_service)
 
     direct_receiver = (
         messaging_service.create_direct_message_receiver_builder()
-        .with_subscriptions([TopicSubscription.of(initial_topic)])
+        .with_subscriptions([TopicSubscription.of(initial_topic), TopicSubscription.of(initial_news_topic)])
         .build()
     )
 
@@ -169,14 +192,18 @@ def run_subscriber(initial_ticker=None):
         with _subscription_lock:
             _receiver = direct_receiver
             _current_topic = initial_topic
+            _current_news_topic = initial_news_topic
             _backfill_publisher = backfill_publisher
             _backfill_message_builder = backfill_message_builder
 
         if direct_receiver.is_running():
-            print(f"Subscribed to: {initial_topic}\nReady to receive\n")
+            print(f"Subscribed to: {initial_topic} and {initial_news_topic}\nReady to receive\n")
 
         # Same "backfill then live" treatment as switch_ticker() gives
         # every subsequent stock, applied to the one we start on too.
+        # (This also triggers a fresh news fetch — see
+        # BackfillRequestHandler in publisher.py — on top of the
+        # startup news publish the publisher does on its own.)
         _request_backfill(initial_ticker)
 
         # The Solace API delivers messages on its own callback thread,
@@ -193,6 +220,7 @@ def run_subscriber(initial_ticker=None):
         with _subscription_lock:
             _receiver = None
             _current_topic = None
+            _current_news_topic = None
             _backfill_publisher = None
             _backfill_message_builder = None
         print("Terminating Receiver")

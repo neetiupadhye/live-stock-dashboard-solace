@@ -70,6 +70,17 @@ def backfill_request_topic(ticker_symbol):
     return f"{BACKFILL_REQUEST_TOPIC_PREFIX}/{ticker_symbol}"
 
 
+def topic_for_news(ticker_symbol):
+    """
+    The topic a given ticker's news articles are published/subscribed
+    on. Separate namespace from price ticks (different message shape,
+    much lower frequency) but same one-topic-per-ticker convention, so
+    the subscriber can subscribe to just the news for whichever stock
+    it's currently showing.
+    """
+    return f"{TOPIC_PREFIX}/python/news/{ticker_symbol}"
+
+
 def get_broker_props():
     return {
         "solace.messaging.transport.host": os.environ.get("SOLACE_HOST") or "tcp://localhost:55554",
