@@ -1,21 +1,8 @@
 """
 dashboard.py
 
-A live-updating Dash dashboard styled after the "Market Insight" trading
-UI reference: dark theme, top nav bar, big price header, chart card with
-timeframe/chart-type controls, and a sidebar stats panel.
-
-This file only READS from data_store — it never writes to it.
+A live-updating Dash dashboard. This file only READS from data_store — it never writes to it.
 The writing happens in subscriber.py.
-
-Honesty note on data: the reference mockup shows fields this pipeline
-doesn't actually have (Volume, Market Cap, 52-Week range, P/E, Div
-Yield, Order Book, multi-timeframe history). Rather than fabricate
-numbers for those, this dashboard shows them as "N/A" and disables the
-controls (timeframes other than 1D, candlestick view) that would need
-data we don't collect. Only Current Price, Open, High, and Low are
-computed from real ticks in data_store, plus a moving average line
-computed from that same real data.
 
 Zoom: click-and-drag on the chart to box-zoom into a time range
 (Plotly's default drag behavior). Double-clicking inside the chart
@@ -34,19 +21,17 @@ from subscriber import switch_ticker
 
 # --- Config -----------------------------------------------------------
 
-# How often the chart redraws itself, in milliseconds.
-REFRESH_INTERVAL_MS = 1000
+REFRESH_INTERVAL_MS = 1000 #redraw rate in milliseconds.
 
-# The ticker shown when the dashboard first loads — matches the topic
-# the subscriber starts subscribed to (see main.py).
-DEFAULT_TICKER = AVAILABLE_TICKERS[0]
+DEFAULT_TICKER = AVAILABLE_TICKERS[0] #ticker shown when the dashboard first loads
+#it is also the default ticker subscriber is subscribed to 
 
 def _ticker_display_info(ticker_symbol):
     """Look up display name/exchange/currency for a ticker, with a
     reasonable fallback for tickers not listed in TICKER_INFO."""
     return TICKER_INFO.get(
         ticker_symbol,
-        {"name": ticker_symbol, "exchange": "—", "currency": "USD"},
+        {"name": ticker_symbol, "exchange": "SGX", "currency": "SDG"},
     )
 
 
