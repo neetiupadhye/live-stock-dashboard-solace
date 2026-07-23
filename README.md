@@ -2,7 +2,7 @@
 
 A real-time, multi-stock price pipeline built on **Solace PubSub+** event streaming, with live market data pulled from **Yahoo Finance** and visualized in an auto-refreshing **Dash** web dashboard.
 
-The project demonstrates an end-to-end event-driven architecture: a standalone publisher polls market data (and, on a slower cadence, news) and publishes it onto a Solace message broker, a standalone subscriber consumes it back off the broker into thread-safe in-memory stores, and a Dash dashboard reads those stores to drive a live-updating chart and a news sidebar — with a dropdown that lets you switch which stock you're watching at any time. The dashboard never talks to Yahoo Finance directly; it only ever reads from the local stores the pub/sub pipeline keeps filled.
+The project demonstrates an end-to-end event-driven architecture: a standalone publisher polls market data (and, at a slower speed, news) and publishes it onto a Solace message broker. A standalone subscriber consumes it back off the broker into thread-safe in-memory stores, and a Dash dashboard reads those stores to create a live-updating chart and a news sidebar. The dashboard also has a dropdown that lets you switch which stock you're watching at any time. The dashboard never talks to Yahoo Finance directly; it only reads from the local stores that the pub/sub pipeline keeps filled, ensuring the two processes stay decoupled.
 
 ---
 
@@ -34,21 +34,22 @@ The project demonstrates an end-to-end event-driven architecture: a standalone p
                         └──────────────────┘
 ```
 
-*(Diagram shows the price-tick path; news flows through the same publisher → broker → subscriber → dashboard shape, one topic per ticker under `solace/samples/python/news/<TICKER>`, landing in a parallel `news_store.py` — see below.)*
+*(Diagram shows the price-tick path)*
+News flows through the same pipeline shape, with a new topic being created for each ticker in the syntax `solace/samples/python/news/<TICKER>`, but lands in a parallel `news_store.py`*
 
-`main.py` wires together the **receiving** side of the pipeline: it starts `subscriber.py` on a background thread and runs the Dash server (`dashboard.py`) on the main thread. Both share a single `data_store` instance (and a single `news_store` instance) in memory, guarded by locks, so producer and consumer never race.
+`main.py` wires together the **receiving** side of the pipeline: it starts `subscriber.py` on a background thread and runs the Dash server (`dashboard.py`) on the main thread. Both share a single `data_store` and `news_store` instance in memory, guarded by locks, so that the producer and consumer never erase changes made by the other.
 
-`publisher.py` is a fully separate, standalone process — it can run on the same machine or a completely different one, as long as it points (via the `SOLACE_*` env vars) at the same broker the subscriber is connected to.
+`publisher.py` is a fully separate, standalone process. It can run on the same machine or a completely different one, as long as it points (via the `SOLACE_*` env vars) at the same broker the subscriber is connected to.
 
 ---
 
 ## How It Works
 
 1. **`publisher.py`** polls Yahoo Finance every 15 seconds (`POLL_INTERVAL_SECONDS`) for the latest 1-minute price bar of every ticker in `AVAILABLE_TICKERS`, and publishes any new bar as a JSON message to that ticker's own Solace topic (`solace/samples/python/stocks/<TICKER>`). On startup it also replays each ticker's full day-so-far history so a dashboard opened mid-session isn't starting from an empty chart. Separately, on a much slower cadence (`NEWS_POLL_INTERVAL_SECONDS`, 5 minutes by default), it also fetches each ticker's latest news via `yfinance` and publishes it to that ticker's own news topic (`solace/samples/python/news/<TICKER>`).
-2. **`subscriber.py`** connects to the same broker and subscribes to exactly **one** ticker's price topic **and** that same ticker's news topic at a time — whichever one the dashboard currently has selected — and routes each incoming message into the shared `data_store` or `news_store` depending on its shape.
-3. When you pick a different stock in the dashboard's dropdown, `subscriber.switch_ticker()` re-points both the live price and news subscriptions at the new ticker's topics **and** sends a backfill request to the publisher (on a separate request topic), asking it to replay that ticker's day-so-far price history *and* refresh its news. This gives every stock the same "full history, then live" experience the first ticker gets at startup, instead of building the chart (or news box) up from scratch on whatever happens to arrive after you switched to it.
-4. **`data_store.py`** keeps a separate, bounded series of price points per ticker (not just the one currently selected), so switching back to a stock you looked at earlier doesn't lose what was already collected for it. **`news_store.py`** does the same for news, keeping the latest fetched article list per ticker.
-5. **`dashboard.py`** runs a Dash app styled as a dark-themed trading UI. It polls `data_store` and `news_store` once per second for the selected ticker and redraws the live price chart, Current/Open/High/Low stats, and a Latest News sidebar box — all sourced from real data already sitting in the local stores. Fields the data doesn't actually support (Volume, Market Cap, 52-Week range, P/E, multi-timeframe candles, etc.) are shown as "N/A" or disabled rather than faked.
+2. **`dashboard.py`** runs a Dash app styled as a dark-themed trading UI. It polls `data_store` and `news_store` once per second for the selected ticker and redraws the live price chart, Current/Open/High/Low stats, and a Latest News sidebar box — all sourced from real data already sitting in the local stores. 
+3. **`subscriber.py`** connects to the same broker and subscribes to exactly **one** ticker's price topic **and** that same ticker's news topic at a time — whichever one the dashboard currently has selected — and routes each incoming message into the shared `data_store` or `news_store` depending on its shape.
+4. When you pick a different stock in the dashboard's dropdown, `subscriber.switch_ticker()` re-points both the live price and news subscriptions at the new ticker's topics **and** sends a backfill request to the publisher (on a separate request topic), asking it to replay that ticker's day-so-far price history *and* refresh its news. This gives every stock the same "full history, then live" experience the first ticker gets at startup, instead of building the chart (or news box) up from scratch on whatever happens to arrive after you switched to it.
+5. **`data_store.py`** keeps a separate, bounded series of price points per ticker (not just the one currently selected), so switching back to a stock you looked at earlier doesn't lose what was already collected for it. **`news_store.py`** does the same for news, keeping the latest fetched article list per ticker.
 6. **`main.py`** is the entry point for the receiving side — it starts the subscriber on a background thread and then blocks on the Dash server. The publisher is started separately.
 
 This publish → receive → store path (rather than the dashboard reading Yahoo Finance directly) is intentional, for both price and news: it exercises the full pub/sub path end-to-end, the same pattern you'd use if the publisher and dashboard consumer were genuinely separate services on separate machines, and it keeps the dashboard's render path free of any network calls of its own.
@@ -57,13 +58,12 @@ This publish → receive → store path (rather than the dashboard reading Yahoo
 
 ## Features
 
-- 📈 **Live market data** — real intraday quotes via `yfinance`, not simulated data
+- 📈 **Live market data** — real intraday quotes via `yfinance`, not simulated data (with a delay of ~10 min) 
 - 📰 **Per-stock news sidebar** — latest headlines for whichever ticker is selected, fetched via `yfinance` and delivered through the same event-driven pipeline, not a direct call from the dashboard
 - 🔀 **Multi-stock support** — switch between tickers live via a dropdown, with automatic history *and news* backfill on every switch
 - 🔁 **Event-driven pipeline** — Solace PubSub+ direct messaging for publish/subscribe, with a dedicated backfill-request topic for on-demand history (and news) replay
 - 🧵 **Thread-safe, per-ticker shared state** — lock-protected in-memory stores hold price history and news for every ticker you've visited, not just the current one
 - 📊 **Auto-refreshing dashboard** — dark-themed "Market Insight" style UI that redraws every second with no manual reload
-- 🟢 **Live vs. closed-market awareness** — each tick is tagged live/closed based on how recent its bar timestamp is relative to now (`LIVE_FRESHNESS_WINDOW_SECONDS`), so a closed market shows "MARKET CLOSED" instead of a misleading "LIVE" badge
 - ⚙️ **Configurable via environment variables** — broker host, VPN, and credentials are all overridable
 - 🧩 **Independently deployable** — publisher and subscriber/dashboard can run on different machines, as long as both reach the same Solace broker
 
@@ -94,7 +94,7 @@ This publish → receive → store path (rather than the dashboard reading Yahoo
 
 ```bash
 # Clone the repo
-git clone https://github.com/<neetiupadhye>/live-stock-dashboard-solace.git
+git clone https://github.com/neetiupadhye/live-stock-dashboard-solace.git
 cd live-stock-dashboard-solace
 
 # (Recommended) create a virtual environment
@@ -112,11 +112,11 @@ pip install -r requirements.txt
 The Solace connection is configured via environment variables, with sensible local defaults baked in:
 
 | Variable           | Description             |
-|---------------------|--------------------------|
-| `SOLACE_HOST`       | Broker connection URI   |
-| `SOLACE_VPN`        | Message VPN name        |
-| `SOLACE_USERNAME`   | Broker username         |
-| `SOLACE_PASSWORD`   | Broker password         |
+|--------------------|-------------------------|
+| `SOLACE_HOST`      | Broker connection URI   |
+| `SOLACE_VPN`       | Message VPN name        |
+| `SOLACE_USERNAME`  | Broker username         |
+| `SOLACE_PASSWORD`  | Broker password         |
 
 Example (pointing at a Solace Cloud instance):
 
@@ -215,17 +215,4 @@ python3 publisher.py      # runs just the publisher
 - **Why keep data for every ticker, not just the selected one?** So switching back to a stock you already looked at doesn't lose what was collected for it, even though only one ticker is actively subscribed to live updates at a time. This applies to both price history and news.
 - **Why a lock around the shared stores?** The subscriber writes on its own receiver thread while Dash reads on a timer on the main thread — the lock prevents any read/write race on the underlying per-ticker data structures.
 - **Why doesn't `dashboard.py` fetch news itself?** Keeping the dashboard's render path free of any network calls is the whole point of the pub/sub pipeline — the same reason it doesn't call `yfinance` directly for prices. News is no exception: `dashboard.py` only ever reads `news_store`, which `subscriber.py` fills from messages the publisher already fetched and published.
-- **Why show "N/A" for some dashboard fields?** The reference UI this dashboard is styled after shows fields (Volume, Market Cap, 52-Week range, P/E, Dividend Yield, Order Book, multi-timeframe candles) that this pipeline doesn't actually collect. Rather than fabricate numbers, those fields are shown as "N/A" and the controls that would need them are disabled.
 - **Why does startup order matter?** Solace direct messaging (used throughout this project) delivers a message only to subscribers listening at the moment it's published — it isn't queued for later. The subscriber's initial backfill request is sent the moment it connects, so if the publisher isn't up yet to receive it, that first request is simply lost and the chart sits empty until you trigger another one (e.g. by switching tickers).
-
----
-
-## Potential Improvements
-
-- [ ] Add a `pyproject.toml` for reproducible installs alongside `requirements.txt`
-- [ ] Persist historical data to a database instead of an in-memory `deque`
-- [ ] Add unit tests for `data_store.py` and the backfill request/reply flow
-- [ ] Containerize with Docker Compose (publisher + subscriber/dashboard + local Solace broker)
-- [ ] Add authentication/config via a `.env` file with `python-dotenv`
-- [ ] Support watching more than one ticker at once (e.g. a multi-chart or watchlist view) instead of one-at-a-time
-- [ ] Have the subscriber retry its initial backfill request if no reply arrives within a short window, to avoid the empty-chart startup race if the publisher isn't up yet
