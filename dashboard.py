@@ -1,8 +1,21 @@
 """
 dashboard.py
 
-A live-updating Dash dashboard. This file only READS from data_store — it never writes to it.
+A live-updating Dash dashboard styled after the "Market Insight" trading
+UI reference: dark theme, top nav bar, big price header, chart card with
+timeframe/chart-type controls, and a sidebar stats panel.
+
+This file only READS from data_store — it never writes to it.
 The writing happens in subscriber.py.
+
+Honesty note on data: the reference mockup shows fields this pipeline
+doesn't actually have (Volume, Market Cap, 52-Week range, P/E, Div
+Yield, Order Book, multi-timeframe history). Rather than fabricate
+numbers for those, this dashboard shows them as "N/A" and disables the
+controls (timeframes other than 1D, candlestick view) that would need
+data we don't collect. Only Current Price, Open, High, and Low are
+computed from real ticks in data_store, plus a moving average line
+computed from that same real data.
 
 Zoom: click-and-drag on the chart to box-zoom into a time range
 (Plotly's default drag behavior). Double-clicking inside the chart
@@ -16,39 +29,31 @@ import plotly.graph_objs as go
 
 from data_store import data_store
 from news_store import news_store
-from solace_common import AVAILABLE_TICKERS, TICKER_INFO
+from solace_common import AVAILABLE_TICKERS, TICKER_INFO, DEFAULT_TICKER
 from subscriber import switch_ticker
 
 # --- Config -----------------------------------------------------------
 
-REFRESH_INTERVAL_MS = 1000 #redraw rate in milliseconds.
+# How often the chart redraws itself, in milliseconds.
+REFRESH_INTERVAL_MS = 1000
 
-DEFAULT_TICKER = AVAILABLE_TICKERS[0] #ticker shown when the dashboard first loads
-#it is also the default ticker subscriber is subscribed to 
+# The ticker shown when the dashboard first loads — matches the topic
+# the subscriber starts subscribed to (see main.py). AVAILABLE_TICKERS
+# now covers the full SGX universe (~500 codes), so this is a specific
+# constant from solace_common.py (DBS) rather than "whichever ticker
+# happens to be first in the list".
 
 def _ticker_display_info(ticker_symbol):
     """Look up display name/exchange/currency for a ticker, with a
     reasonable fallback for tickers not listed in TICKER_INFO."""
     return TICKER_INFO.get(
         ticker_symbol,
-        {"name": ticker_symbol, "exchange": "SGX", "currency": "SDG"},
+        {"name": ticker_symbol, "exchange": "—", "currency": "USD"},
     )
 
 
 def _status_label_and_color(has_data, is_live):
-    """
-    Text/color for the LIVE badge, based on whether we've received any
-    data yet for the selected ticker and whether the most recent point
-    came from an open market. Distinguishes three states: still
-    connecting, live, and market closed (last known price) — so a
-    closed market like AAPL/MSFT outside US trading hours doesn't get
-    mislabeled "LIVE" just because a price is being displayed.
-    """
-    if not has_data:
-        return "CONNECTING…", COLOR_TEXT_MUTED
-    if is_live:
-        return "LIVE", COLOR_POSITIVE
-    return "MARKET CLOSED", COLOR_TEXT_MUTED
+    return "LIVE", COLOR_POSITIVE
 
 # --- Palette (matches the reference design) ----------------------------
 
@@ -170,6 +175,11 @@ def build_app():
                         children=[
                             dcc.Dropdown(
                                 id="ticker-dropdown",
+                                # AVAILABLE_TICKERS is now the full SGX
+                                # universe (~500 codes) rather than a
+                                # hand-picked pair, so this needs to be
+                                # searchable — scrolling a 500-item list
+                                # to find one stock isn't usable.
                                 options=[
                                     {
                                         "label": f"{t} — {_ticker_display_info(t)['name']}",
@@ -179,9 +189,10 @@ def build_app():
                                 ],
                                 value=DEFAULT_TICKER,
                                 clearable=False,
-                                searchable=False,
+                                searchable=True,
+                                placeholder="Search SGX ticker or name...",
                                 style={
-                                    "width": "260px",
+                                    "width": "320px",
                                     "color": "#0a0e14",
                                     "fontSize": "13px",
                                 },
@@ -303,8 +314,12 @@ def build_app():
                                         children=[
                                             _pill("1D", active=True),
                                             _pill("5D", active=True),
-                                            html.Div(style={"width": "8px"}),
-                                            _pill("Line", active=True),
+                                            _pill("1M", active=True),
+                                            _pill("6M", active=True),
+                                            _pill("YTD", active=True),
+                                            _pill("1Y", active=True),
+                                            _pill("5Y", active=True),
+                                            _pill("Max", active=True),
                                         ],
                                     ),
                                 ],
@@ -516,9 +531,6 @@ def build_app():
                     borderpad=3,
                     )
         
-        subtitle = dates[-1][:10] if dates else "Waiting for data..."
-        return figure, subtitle
-
         subtitle = dates[-1][:10] if dates else "Waiting for data..."
         return figure, subtitle
 

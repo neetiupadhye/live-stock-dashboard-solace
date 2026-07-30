@@ -14,7 +14,12 @@ the publisher, asking it to replay that ticker's day-so-far history
 onto its normal data topic before live ticks resume — so picking a
 stock always gets the same "full history, then live" treatment the
 very first ticker gets, instead of only building up a chart from
-whatever ticks happen to arrive after you switched to it.
+whatever ticks happen to arrive after you switched to it. This same
+message also tells the publisher to start actively polling that
+ticker going forward, since with the full SGX universe in play the
+publisher can no longer just poll everything all the time (see
+publisher.py). Switching away from a ticker sends a companion "stop"
+message so the publisher can drop it from active polling too.
 
 This is what feeds the dashboard, so it needs to run in the same
 process as dashboard.py (see main.py) since they share the in-memory
@@ -41,6 +46,7 @@ from data_store import data_store
 from news_store import news_store
 from solace_common import (
     AVAILABLE_TICKERS,
+    DEFAULT_TICKER,
     topic_for_ticker,
     topic_for_news,
     backfill_request_topic,
@@ -55,6 +61,7 @@ from solace_common import (
 # _subscription_lock, since it can be called from the dashboard's
 # callback thread while the receiver is running.
 _receiver = None
+_current_ticker = None
 _current_topic = None
 _current_news_topic = None
 _backfill_publisher = None
@@ -90,26 +97,49 @@ class MessageHandlerImpl(MessageHandler):
             print(f"Error processing message: {e}")
 
 
-def _request_backfill(ticker):
+def _publish_backfill_control(ticker, action):
     """
-    Ask the publisher to replay `ticker`'s day-so-far bars onto its
-    normal data topic (see BackfillRequestHandler in publisher.py).
-    Best-effort: if there's no publisher listening, this just silently
-    does nothing and the chart builds up from live ticks only, same
-    as before this feature existed.
+    Shared send path for both directions of the backfill-control
+    message (see BackfillControlHandler in publisher.py). Best-effort:
+    if there's no publisher listening, this just silently does
+    nothing, same as before this feature existed.
     """
     if _backfill_publisher is None:
         return
     try:
-        payload = json.dumps({"ticker": ticker})
+        payload = json.dumps({"ticker": ticker, "action": action})
         outbound_message = _backfill_message_builder.build(payload)
         _backfill_publisher.publish(
             destination=Topic.of(backfill_request_topic(ticker)),
             message=outbound_message,
         )
-        print(f"Requested backfill for {ticker}")
     except PubSubPlusClientError as exception:
-        print(f"Failed to request backfill for {ticker}: {exception}")
+        print(f"Failed to send backfill '{action}' for {ticker}: {exception}")
+
+
+def _request_backfill(ticker):
+    """
+    Ask the publisher to replay `ticker`'s day-so-far bars onto its
+    normal data topic, and — since the publisher now only actively
+    polls tickers a dashboard is watching (see publisher.py's
+    active-ticker set, needed once AVAILABLE_TICKERS covers the whole
+    SGX universe instead of a couple of tickers) — start actively
+    polling it going forward.
+    """
+    _publish_backfill_control(ticker, "start")
+    print(f"Requested backfill/activation for {ticker}")
+
+
+def _request_backfill_stop(ticker):
+    """
+    Tell the publisher this ticker no longer has a dashboard watching
+    it, so it can stop spending poll cycles on it. Sent right before
+    switching away from a ticker. If this message is ever lost (e.g.
+    this process crashes mid-switch), the publisher's own idle-timeout
+    eviction cleans it up eventually anyway.
+    """
+    _publish_backfill_control(ticker, "stop")
+    print(f"Sent backfill stop for {ticker}")
 
 
 def switch_ticker(new_ticker):
@@ -123,7 +153,7 @@ def switch_ticker(new_ticker):
     Returns True if the subscription is (now) on new_ticker's topic,
     False if the receiver isn't up yet.
     """
-    global _current_topic, _current_news_topic
+    global _current_ticker, _current_topic, _current_news_topic
 
     with _subscription_lock:
         if _receiver is None:
@@ -133,6 +163,8 @@ def switch_ticker(new_ticker):
         new_news_topic = topic_for_news(new_ticker)
         if new_topic == _current_topic:
             return True  # already subscribed to this one
+
+        old_ticker = _current_ticker
 
         try:
             # Subscribe to both new topics BEFORE clearing/requesting,
@@ -156,9 +188,18 @@ def switch_ticker(new_ticker):
                 _receiver.remove_subscription(TopicSubscription.of(_current_topic))
             if _current_news_topic is not None:
                 _receiver.remove_subscription(TopicSubscription.of(_current_news_topic))
+            _current_ticker = new_ticker
             _current_topic = new_topic
             _current_news_topic = new_news_topic
             print(f"Switched live subscription to: {new_topic} and {new_news_topic}")
+
+            # Tell the publisher it can stop actively polling the
+            # ticker we just left — done last (after the new
+            # subscriptions are confirmed live) so there's no gap
+            # where a ticker is neither the "old" nor "new" active one.
+            if old_ticker is not None and old_ticker != new_ticker:
+                _request_backfill_stop(old_ticker)
+
             return True
         except PubSubPlusClientError as exception:
             print(f"Failed to switch subscription to {new_topic}: {exception}")
@@ -166,9 +207,9 @@ def switch_ticker(new_ticker):
 
 
 def run_subscriber(initial_ticker=None):
-    global _receiver, _current_topic, _current_news_topic, _backfill_publisher, _backfill_message_builder
+    global _receiver, _current_ticker, _current_topic, _current_news_topic, _backfill_publisher, _backfill_message_builder
 
-    initial_ticker = initial_ticker or AVAILABLE_TICKERS[0]
+    initial_ticker = initial_ticker or DEFAULT_TICKER
     initial_topic = topic_for_ticker(initial_ticker)
     initial_news_topic = topic_for_news(initial_ticker)
 
@@ -191,6 +232,7 @@ def run_subscriber(initial_ticker=None):
 
         with _subscription_lock:
             _receiver = direct_receiver
+            _current_ticker = initial_ticker
             _current_topic = initial_topic
             _current_news_topic = initial_news_topic
             _backfill_publisher = backfill_publisher
@@ -219,6 +261,7 @@ def run_subscriber(initial_ticker=None):
     finally:
         with _subscription_lock:
             _receiver = None
+            _current_ticker = None
             _current_topic = None
             _current_news_topic = None
             _backfill_publisher = None

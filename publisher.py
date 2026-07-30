@@ -1,8 +1,9 @@
 """
 publisher.py
 
-Standalone publisher: polls yfinance for the latest price of TICKER
-and publishes each new tick to the Solace broker.
+Standalone publisher: polls yfinance for the latest price of whichever
+tickers are currently being watched by a dashboard, and publishes each
+new tick to the Solace broker.
 
 Runs completely independently of the subscriber/dashboard — you can
 run this on a different machine than the one running subscriber.py +
@@ -12,6 +13,22 @@ solace_common.py and the SOLACE_* environment variables).
 Run directly:
 
     python3 publisher.py
+
+--- Why this doesn't just loop over every SGX ticker ---
+solace_common.ALL_SGX_TICKERS/AVAILABLE_TICKERS is the *dropdown*
+universe (all ~500 SGX-listed codes) — it is deliberately NOT what
+this file polls. Polling 500 tickers every cycle would mean each
+cycle takes far longer than POLL_INTERVAL_SECONDS to even get through
+everyone once, and hammering yfinance with hundreds of sequential
+requests on a tight loop is a good way to get rate-limited.
+
+Instead, this file maintains an ACTIVE-TICKER SET: only tickers a
+dashboard is actually watching right now. A ticker enters the active
+set when a "start" backfill-control message arrives (some dashboard
+just switched to it, or started up on it) and leaves it when a "stop"
+message arrives (the dashboard switched away), with an idle timeout as
+a safety net in case a stop message is ever lost (e.g. the subscriber
+process crashes mid-session).
 """
 
 import time
@@ -39,17 +56,28 @@ from solace_common import (
 )
 
 POLL_INTERVAL_SECONDS = 15   # 1-minute bars can't update faster than once a minute anyway; 15s just catches the new bar promptly
-# NOTE: this interval applies per poll cycle, and each cycle now polls
-# every ticker in AVAILABLE_TICKERS in turn. If you add a lot of
-# tickers and start seeing yfinance rate-limit errors, raise this.
+# NOTE: this interval applies per poll cycle, and each cycle polls
+# every ticker currently in the ACTIVE set (see _active_tickers
+# below) — not the full SGX universe. The active set is normally
+# small (one ticker per open dashboard), so this stays fast regardless
+# of how big AVAILABLE_TICKERS/ALL_SGX_TICKERS grows.
 
 # News doesn't need per-tick freshness the way prices do, so it's
-# polled on its own, much slower cadence within the same main loop.
+# polled on its own, much slower cadence, tracked per-ticker below.
 NEWS_POLL_INTERVAL_SECONDS = 300   # 5 minutes
 
 # How many articles to keep per ticker per publish — keeps messages
 # small and the sidebar box from growing unbounded.
 NEWS_ARTICLES_PER_TICKER = 5
+
+# Safety-net eviction: if a ticker's "stop" message is ever lost
+# (subscriber crash, network blip), this is the fallback that keeps
+# the active set from only ever growing. Deliberately long, since the
+# *normal* path for leaving the active set is the explicit stop
+# message sent the moment a dashboard switches away — this is just
+# cleanup for orphans, not the everyday mechanism, so it's set well
+# above any realistic "still looking at the same stock" session.
+IDLE_EVICTION_SECONDS = 4 * 60 * 60  # 4 hours
 
 # How recent a bar's own timestamp has to be, relative to wall-clock
 # now, to count as "live" rather than "last known price from a closed
@@ -92,12 +120,6 @@ def get_latest_quote(ticker_symbol):
 
 
 def get_intraday_history(ticker_symbol):
-    """
-    Fetch every 1-minute bar for the current trading day so far, oldest
-    first. Used once at startup to backfill the chart from market open
-    up to now, before switching over to live polling of just the latest
-    bar via get_latest_quote().
-    """
     ticker_obj = yf.Ticker(ticker_symbol)
     bars = ticker_obj.history(period="1d", interval="1m")
     if bars.empty:
@@ -160,25 +182,106 @@ def get_latest_news(ticker_symbol):
     return articles
 
 
+# ---------------------------------------------------------------------
+# Active-ticker set
+#
+# ticker -> {
+#   "added_at": monotonic time this ticker entered the active set,
+#   "last_published_date": the "date" field of the last quote we
+#       published for this ticker, so the poll loop doesn't republish
+#       the same 1-minute bar every cycle,
+#   "last_news_at": monotonic time news was last fetched+published for
+#       this ticker, or None if never (so the very first poll cycle
+#       after activation always refreshes news, matching the old
+#       "fetch news immediately on backfill" behavior),
+# }
+#
+# Guarded by _active_lock since BackfillControlHandler runs on the
+# SDK's message-callback thread while the main polling loop runs on
+# the main thread.
+# ---------------------------------------------------------------------
+_active_tickers = {}
+_active_lock = threading.Lock()
+
+
+def _activate_ticker(ticker):
+    """Add `ticker` to the active set (or just leave it as-is if
+    already active — a repeat "start" shouldn't reset its
+    last_published_date/last_news_at and cause a duplicate replay)."""
+    with _active_lock:
+        if ticker not in _active_tickers:
+            _active_tickers[ticker] = {
+                "added_at": time.monotonic(),
+                "last_published_date": None,
+                "last_news_at": None,
+            }
+            return True
+        return False
+
+
+def _deactivate_ticker(ticker):
+    with _active_lock:
+        _active_tickers.pop(ticker, None)
+
+
+def _active_snapshot():
+    """The list of currently-active tickers, safe to iterate over
+    without holding the lock for the whole poll cycle."""
+    with _active_lock:
+        return list(_active_tickers.keys())
+
+
+def _get_meta(ticker):
+    with _active_lock:
+        return _active_tickers.get(ticker)
+
+
+def _set_last_published_date(ticker, date):
+    with _active_lock:
+        if ticker in _active_tickers:
+            _active_tickers[ticker]["last_published_date"] = date
+
+
+def _set_last_news_at(ticker, when):
+    with _active_lock:
+        if ticker in _active_tickers:
+            _active_tickers[ticker]["last_news_at"] = when
+
+
+def _evict_idle_tickers():
+    """Safety-net cleanup — see IDLE_EVICTION_SECONDS above. The
+    normal path out of the active set is an explicit "stop" message,
+    not this."""
+    now = time.monotonic()
+    with _active_lock:
+        stale = [t for t, meta in _active_tickers.items() if now - meta["added_at"] > IDLE_EVICTION_SECONDS]
+        for t in stale:
+            del _active_tickers[t]
+    for t in stale:
+        print(f"Evicting {t} from active polling (idle timeout, no stop message received)")
+
+
 class PublisherErrorHandling(PublishFailureListener):
     def on_failed_publish(self, e: "FailedPublishEvent"):
         print("on_failed_publish")
 
 
-class BackfillRequestHandler(MessageHandler):
+class BackfillControlHandler(MessageHandler):
     """
-    Listens on BACKFILL_REQUEST_TOPIC_PREFIX/{ticker}. Whenever the
-    subscriber switches to a ticker it doesn't have history for yet,
-    it publishes a request here; this handler refetches that ticker's
-    day-so-far bars and republishes them on the normal data topic —
-    the same get_intraday_history() + publish_quote() path used for
-    the one-time startup backfill, just re-triggered on demand.
+    Listens on BACKFILL_REQUEST_TOPIC_PREFIX/{ticker}. Each message
+    carries {"ticker": ..., "action": "start"|"stop"}:
 
-    Also treats a backfill request as the signal to refresh that
-    ticker's news: switching to a stock is exactly the moment its news
-    is most likely to be stale (or missing, if this process is the
-    first one ever to look at it), so it gets a fresh fetch+publish
-    right away rather than waiting for the next periodic news cycle.
+    - "start": fired when a dashboard starts up on a ticker or
+      switches to one. Activates the ticker for ongoing live polling
+      (if not already active) and immediately refetches its
+      day-so-far bars plus fresh news — the same "full history, then
+      live" treatment every activated ticker gets.
+    - "stop": fired when a dashboard switches AWAY from a ticker.
+      Removes it from the active set so the publisher stops spending
+      poll cycles on stocks nobody is currently watching.
+
+    A single Direct Receiver only takes one MessageHandler, so both
+    directions share this one handler rather than two separate ones.
     """
 
     def __init__(self, publish_quote_fn, publish_news_fn):
@@ -192,20 +295,32 @@ class BackfillRequestHandler(MessageHandler):
                 payload = payload.decode()
             data = json.loads(payload)
             ticker = data.get("ticker")
+            action = data.get("action", "start")  # default "start" keeps old callers (no action field) working
         except Exception as e:
-            print(f"Error processing backfill request: {e}")
+            print(f"Error processing backfill control message: {e}")
             return
 
         if not ticker or ticker not in AVAILABLE_TICKERS:
             return
 
+        if action == "stop":
+            _deactivate_ticker(ticker)
+            print(f"Stop received for {ticker}, no longer actively polling it")
+            return
+
+        is_new = _activate_ticker(ticker)
+        if not is_new:
+            # Already active (e.g. a duplicate/retried "start") — no
+            # need to replay history again.
+            return
+
         # Run the actual yfinance fetch + republish on its own thread
         # so a slow fetch doesn't block the SDK's message-callback
-        # thread (which would delay processing of other requests/ticks).
+        # thread (which would delay processing of other requests).
         threading.Thread(target=self._replay, args=(ticker,), daemon=True).start()
 
     def _replay(self, ticker):
-        print(f"Backfill requested for {ticker}, refetching day-so-far history...")
+        print(f"Activating {ticker}: fetching day-so-far history...")
         try:
             history = get_intraday_history(ticker)
         except Exception as e:
@@ -214,12 +329,15 @@ class BackfillRequestHandler(MessageHandler):
 
         for quote in history:
             self._publish_quote(quote)
+        if history:
+            _set_last_published_date(ticker, history[-1]["date"])
         print(f"Backfill replay complete for {ticker} ({len(history)} bars)")
 
         try:
             self._publish_news(ticker)
+            _set_last_news_at(ticker, time.monotonic())
         except Exception as e:
-            print(f"Error refreshing news for {ticker}: {e}")
+            print(f"Error fetching initial news for {ticker}: {e}")
 
 
 def run_publisher():
@@ -268,58 +386,34 @@ def run_publisher():
         )
         print(f"Published [{ticker}] news: {len(articles)} article(s)")
 
-    # Listens for on-demand backfill requests (see BackfillRequestHandler)
-    # so a dashboard switching tickers can get the same "full day-so-far
-    # then live" treatment the very first ticker gets at startup — and,
-    # now, a fresh news fetch too.
+    # Listens for on-demand start/stop control messages (see
+    # BackfillControlHandler above) so the active-ticker set stays
+    # sized to whatever dashboards are actually watching, instead of
+    # this file ever needing to loop over the full SGX universe.
     backfill_receiver = (
         messaging_service.create_direct_message_receiver_builder()
         .with_subscriptions([TopicSubscription.of(BACKFILL_REQUEST_TOPIC_PREFIX + "/>")])
         .build()
     )
     backfill_receiver.start()
-    backfill_receiver.receive_async(BackfillRequestHandler(publish_quote, publish_news))
+    backfill_receiver.receive_async(BackfillControlHandler(publish_quote, publish_news))
 
     try:
-        print(f"Publishing {AVAILABLE_TICKERS} (one topic per ticker) every {POLL_INTERVAL_SECONDS}s...\n")
+        print(f"Publisher ready. Serving on-demand backfill for any of {len(AVAILABLE_TICKERS)} SGX tickers.")
+        print(f"Actively polling only tickers currently watched by a dashboard, every {POLL_INTERVAL_SECONDS}s.\n")
 
-        # Tracks the last bar timestamp we published per ticker, so we
-        # don't republish the same 1-minute bar every cycle.
-        last_published_date = {ticker: None for ticker in AVAILABLE_TICKERS}
+        last_eviction_check = time.monotonic()
+        eviction_check_interval = 60  # only need to check idle eviction occasionally, not every poll cycle
 
-        # --- One-time backfill: for each ticker, send every 1-minute
-        # bar from market open up to now, so a dashboard opened
-        # mid-session (or before any live ticks have happened) still
-        # shows the full day so far for whichever stock it picks.
-        for ticker in AVAILABLE_TICKERS:
-            try:
-                history = get_intraday_history(ticker)
-            except Exception as e:
-                print(f"Error fetching backfill history for {ticker}: {e}")
-                history = []
-
-            if history:
-                print(f"Backfilling {len(history)} bars for {ticker}...")
-                for quote in history:
-                    publish_quote(quote)
-                    last_published_date[ticker] = quote["date"]
-        print("Backfill complete. Switching to live polling.\n")
-
-        # --- Initial news: one fetch+publish per ticker at startup,
-        # same idea as the price backfill above, so a dashboard opened
-        # right away still has news to show instead of an empty box
-        # until the first NEWS_POLL_INTERVAL_SECONDS cycle completes.
-        for ticker in AVAILABLE_TICKERS:
-            try:
-                publish_news(ticker)
-            except Exception as e:
-                print(f"Error fetching initial news for {ticker}: {e}")
-        last_news_published_at = time.monotonic()
-
-        # --- Live polling: each cycle, poll every ticker in turn and
-        # publish only the ones with a new bar since last time.
+        # --- Live polling: each cycle, poll only the currently-active
+        # tickers (dashboards actually watching something), and check
+        # each active ticker's own news timer independently.
         while True:
-            for ticker in AVAILABLE_TICKERS:
+            for ticker in _active_snapshot():
+                meta = _get_meta(ticker)
+                if meta is None:
+                    continue  # deactivated between the snapshot and now
+
                 try:
                     quote = get_latest_quote(ticker)
                 except Exception as e:
@@ -328,26 +422,25 @@ def run_publisher():
 
                 print(f"Fetched [{ticker}] ({'LIVE' if quote['is_live'] else 'CLOSED'}): market_time={quote['date']} -> {quote['current']} (polled at {quote['fetched_at']})")
 
-                # Skip re-publishing the same 1-minute bar the backfill
-                # (or the previous poll) already sent for this ticker.
-                if quote["date"] == last_published_date[ticker]:
-                    continue
+                if quote["date"] != meta["last_published_date"]:
+                    publish_quote(quote)
+                    _set_last_published_date(ticker, quote["date"])
 
-                publish_quote(quote)
-                last_published_date[ticker] = quote["date"]
-
-            # News is polled on its own, much slower cadence than
-            # price — checked once per price-poll cycle rather than
-            # slept on separately, so one thread/loop covers both and
-            # a backfill-triggered refresh (see BackfillRequestHandler)
-            # can still happen in between these periodic ones.
-            if time.monotonic() - last_news_published_at >= NEWS_POLL_INTERVAL_SECONDS:
-                for ticker in AVAILABLE_TICKERS:
+                # Per-ticker news timer: each ticker checks its own
+                # cadence rather than everyone sharing one global
+                # timer, since tickers get activated at different
+                # times (naturally staggering their news refreshes).
+                last_news_at = meta["last_news_at"]
+                if last_news_at is None or time.monotonic() - last_news_at >= NEWS_POLL_INTERVAL_SECONDS:
                     try:
                         publish_news(ticker)
+                        _set_last_news_at(ticker, time.monotonic())
                     except Exception as e:
                         print(f"Error fetching news for {ticker}: {e}")
-                last_news_published_at = time.monotonic()
+
+            if time.monotonic() - last_eviction_check >= eviction_check_interval:
+                _evict_idle_tickers()
+                last_eviction_check = time.monotonic()
 
             time.sleep(POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
