@@ -34,8 +34,7 @@ process crashes mid-session).
 import time
 import json
 import threading
-import exchange_calendars as xcals
-import pandas as pd
+import datetime
 
 from solace.messaging.errors.pubsubplus_client_error import PubSubPlusClientError
 from solace.messaging.publisher.direct_message_publisher import PublishFailureListener, FailedPublishEvent
@@ -80,14 +79,19 @@ NEWS_ARTICLES_PER_TICKER = 5
 # above any realistic "still looking at the same stock" session.
 IDLE_EVICTION_SECONDS = 4 * 60 * 60  # 4 hours
 
-_sgx_calendar = xcals.get_calendar("XSES")
+# How recent a bar's own timestamp has to be, relative to wall-clock
+# now, to count as "live" rather than "last known price from a closed
+# session". 1-minute bars only update while a market is actually
+# trading, so once a market closes, yfinance just keeps returning the
+# same final bar forever — this is what lets us tell the two apart.
+LIVE_FRESHNESS_WINDOW_SECONDS = 180
 
-def is_sgx_open(moment=None):
-    """Whether SGX is in a live trading session right now (or at
-    `moment`, if given) — accounts for weekends, holidays, and
-    half-days via the exchange_calendars XSES calendar."""
-    moment = pd.Timestamp(moment or datetime_now_utc())
-    return _sgx_calendar.is_open_on_minute(moment)
+
+def _is_bar_live(bar_timestamp):
+    """Whether `bar_timestamp` (a tz-aware pandas Timestamp) is recent
+    enough that we consider its market open/live right now."""
+    now = datetime.datetime.now(bar_timestamp.tzinfo)
+    return (now - bar_timestamp) <= datetime.timedelta(seconds=LIVE_FRESHNESS_WINDOW_SECONDS)
 
 
 def get_latest_quote(ticker_symbol):
@@ -111,7 +115,7 @@ def get_latest_quote(ticker_symbol):
         "ticker": ticker_symbol,
         "current": float(last_bar["Close"]),
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),   # debug only: wall-clock poll time
-        "is_live": is_sgx_open(),
+        "is_live": _is_bar_live(bar_timestamp),
     }
 
 
@@ -122,7 +126,6 @@ def get_intraday_history(ticker_symbol):
         return []
 
     fetched_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-    market_open_now = is_sgx_open()          # <-- new: one call, shared by every bar
     quotes = []
     for bar_timestamp, row in bars.iterrows():
         quotes.append({
@@ -130,7 +133,7 @@ def get_intraday_history(ticker_symbol):
             "ticker": ticker_symbol,
             "current": float(row["Close"]),
             "fetched_at": fetched_at,
-            "is_live": market_open_now,       # <-- was _is_bar_live(bar_timestamp)
+            "is_live": _is_bar_live(bar_timestamp),
         })
     return quotes
 
