@@ -3,3 +3,4 @@ plotly
 solace-pubsubplus
 yfinance 
 pandas
+exchange_calendars
